@@ -9,11 +9,6 @@
 ;; Keywords: tools
 
 ;; Package-Version: 4.2.0
-;; Package-Requires: (
-;;     (emacs "27.1")
-;;     (compat "30.0.1.0")
-;;     (dash "2.19.1")
-;;     (seq "2.24"))
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
