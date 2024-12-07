@@ -23,3 +23,6 @@
 *~
 /*.tar
 /*.tar.gz
+
+magit-autoloads.el
+magit-pkg.el
