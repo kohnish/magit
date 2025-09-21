@@ -35,7 +35,6 @@
 (require 'magit-margin)
 (require 'magit-process)
 (require 'magit-transient)
-(require 'magit-autorevert)
 
 ;;; Options
 

@@ -18,15 +18,7 @@
 ;; Keywords: git tools vc
 
 ;; Package-Version: 4.2.0
-;; Package-Requires: (
-;;     (emacs "27.1")
-;;     (compat "30.0.1.0")
-;;     (dash "2.19.1")
-;;     (magit-section "4.2.0")
-;;     (seq "2.24")
-;;     (transient "0.8.2")
-;;     (with-editor "3.4.3"))
-
+;
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; Magit is free software: you can redistribute it and/or modify

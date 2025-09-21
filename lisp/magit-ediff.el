@@ -237,7 +237,7 @@ and alternative commands."
       ;; Ediff assumes that the FILE where it is going to store the merge
       ;; result does not exist yet, so move the existing file out of the
       ;; way.  If a buffer visits FILE, then we have to kill that upfront.
-      (when-let ((buffer (find-buffer-visiting file)))
+      (when-let* ((buffer (find-buffer-visiting file)))
         (when (and (buffer-modified-p buffer)
                    (not (y-or-n-p (format "Save buffer %s %s? "
                                           (buffer-name buffer)
@@ -382,7 +382,7 @@ range)."
   (let ((input (or arg (magit-diff-read-range-or-commit
                         "Compare range or commit"
                         nil mbase))))
-    (if-let ((range (magit-split-range input)))
+    (if-let* ((range (magit-split-range input)))
         (list (car range) (cdr range))
       (list input nil))))
 
