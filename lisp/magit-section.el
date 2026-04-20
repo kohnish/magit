@@ -9,7 +9,7 @@
 ;; Keywords: tools
 
 ;; Package-Version: 4.5.0
-;; Package-Requires: (
+;; Dependencies: (
 ;;     (emacs   "28.1")
 ;;     (compat  "30.1")
 ;;     (cond-let "0.2")
