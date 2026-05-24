@@ -23,7 +23,6 @@
 ;;     (compat       "31.0")
 ;;     (cond-let      "0.2")
 ;;     (llama         "1.0")
-;;     (magit-section "4.5")
 ;;     (seq           "2.24")
 ;;     (transient     "0.13")
 ;;     (with-editor   "3.4"))
