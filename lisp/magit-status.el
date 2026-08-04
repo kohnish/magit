@@ -276,8 +276,17 @@ Non-interactively DIRECTORY is (re-)initialized unconditionally."
                           (expand-file-name directory)))
   (magit-status-setup-buffer directory))
 
+
 ;;;###autoload
-(defun magit-status (&optional directory cache)
+(defun magit-status ()
+  (interactive)
+  (let ((git-root (vc-root-dir)))
+    (if git-root
+        (magit-status-setup-buffer git-root)
+      (message "[magit] INFO: Not in git project"))))
+
+;;;###autoload
+(defun magit-status-old (&optional directory cache)
   "Show the status of the current Git repository in a buffer.
 
 If the current directory isn't located within a Git repository,
@@ -447,7 +456,21 @@ Type \\[magit-commit] to create a commit.
      '("-n256" "--decorate"))
 
 ;;;###autoload
-(defun magit-status-setup-buffer (&optional directory)
+(defun magit-status-setup-buffer (directory)
+  (pcase-let
+      ((`(,dargs ,dfiles) (magit-diff--get-value 'magit-status-mode 'status))
+       (`(,largs ,lfiles) (magit-log--get-value  'magit-status-mode 'status)))
+    (magit-setup-buffer-for-status nil #'magit-status-mode nil
+      :initial-section #'magit-status-goto-initial-section
+      :select-section (and$ (magit-status--get-file-position)
+                            (lambda () (apply #'magit-status--goto-file-position $)))
+      (magit-buffer-diff-args  dargs)
+      (magit-buffer-diff-files dfiles)
+      (magit-buffer-log-args   largs)
+      (magit-buffer-log-files  lfiles))))
+
+;;;###autoload
+(defun magit-status-setup-buffer-old (&optional directory)
   (let ((default-directory (or directory default-directory)))
     (when (file-remote-p default-directory)
       (magit-git-version-assert))

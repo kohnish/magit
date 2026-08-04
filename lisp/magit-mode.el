@@ -695,6 +695,82 @@ INITIAL-SECTION SELECT-SECTION &rest BINDINGS)"
         (run-hooks 'magit-post-create-buffer-hook)))
     buffer))
 
+(defmacro magit-setup-buffer-for-status (git-info mode &optional locked &rest args)
+  "\n\n(fn MODE &optional LOCKED &key BUFFER DIRECTORY \
+INITIAL-SECTION SELECT-SECTION &rest BINDINGS)"
+  (declare (indent 2)
+           (debug (form [&optional locked]
+                        [&rest keywordp form]
+                        [&rest (symbolp form)])))
+  (let (kwargs)
+    (while (keywordp (car args))
+      (push (pop args) kwargs)
+      (push (pop args) kwargs))
+    `(magit-setup-buffer-internal-for-status
+      ,git-info ,mode ,locked
+      ,(cons 'list (mapcar (pcase-lambda (`(,var ,form))
+                             `(list ',var ,form))
+                           args))
+      ,@(nreverse kwargs))))
+
+(cl-defun magit-setup-buffer-internal-for-status
+    ( a b c d
+      &key buffer directory initial-section select-section)
+  "Set up a Magit buffer.
+Supports two calling conventions for backward compatibility:
+  1) (magit-setup-buffer-internal MODE LOCKED BINDINGS &key ...)
+  2) (magit-setup-buffer-internal GIT-INFO MODE LOCKED BINDINGS &key ...)
+The arguments are normalized to MODE, LOCKED and BINDINGS below.
+GIT-INFO is currently ignored but accepted for callers that pass it.
+"
+  (let* ((git-info nil)
+         (mode nil)
+         (locked nil)
+         (bindings nil))
+    ;; Detect whether the first argument is a git-info (nil or a list)
+    ;; followed by a mode, or whether the first arg is the MODE itself.
+    (if (and (or (null a) (listp a)) (functionp b))
+        (progn
+          (setq git-info a
+                mode b
+                locked c
+                bindings d))
+      (progn
+        (setq git-info nil
+              mode a
+              locked b
+              bindings c)))
+    (let* ((value   (and locked
+                        (with-temp-buffer
+                          (mapc (##apply #'set-local %) bindings)
+                          (let ((major-mode mode))
+                            (magit-buffer-value)))))
+           (buffer  (if buffer
+                        (get-buffer-create buffer)
+                      (magit-get-mode-buffer mode value)))
+           (section (and buffer (magit-current-section)))
+           (created (not buffer)))
+      (unless buffer
+        (setq buffer (magit-generate-new-buffer mode value)))
+      (with-current-buffer buffer
+        (setq magit-previous-section section)
+        (when directory
+          (setq default-directory directory))
+        (funcall mode)
+        (magit-xref-setup #'magit-setup-buffer-internal bindings)
+        (mapc (##apply #'set-local %) bindings)
+        (when created
+          (run-hooks 'magit-create-buffer-hook)))
+      (magit-display-buffer buffer)
+      (with-current-buffer buffer
+        (run-hooks 'magit-setup-buffer-hook)
+        (magit-refresh-buffer created
+                              :initial-section initial-section
+                              :select-section select-section)
+        (when created
+          (run-hooks 'magit-post-create-buffer-hook)))
+      buffer)))
+
 ;;; Display Buffer
 
 (defvar magit-display-buffer-noselect nil

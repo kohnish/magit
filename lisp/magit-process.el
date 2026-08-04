@@ -520,6 +520,8 @@ eol conversion."
                 (format-time-string magit-process-record-entry-format)
                 `((?d . ,(abbreviate-file-name default-directory))
                   (?a . ,(magit-process--format-arguments process args)))))))
+  ;; WIP:
+  ;; (message "magit-run: %s %s" process (mapconcat #'identity args " "))
   (let ((process-environment (magit-process-environment))
         (default-process-coding-system (magit--process-coding-system)))
     (apply #'process-file process infile buffer display args)))
