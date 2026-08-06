@@ -335,6 +335,8 @@ to do the following.
 
 (defun magit-git-exit-code (&rest args)
   "Execute Git with ARGS, returning its exit code."
+  ;; (message "WIP: magit-git: git %s" args)
+  ;; (message "WIP: %s" (with-output-to-string (backtrace)))
   (magit-process-git nil args))
 
 (defun magit-git-success (&rest args)
