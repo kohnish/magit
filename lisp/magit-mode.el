@@ -555,10 +555,11 @@ to the kill ring."
 
 (defun magit-load-config-extensions ()
   "Load Magit extensions that are defined at the Git config layer."
-  (dolist (ext (magit-get-all "magit.extension"))
-    (let ((sym (intern (format "magit-%s-mode" ext))))
-      (when (fboundp sym)
-        (funcall sym 1)))))
+  (when-let* ((magit-exts (if git-info-for-hooks (magit-git-info-get 'magit.extension git-info-for-hooks) (magit-get-all "magit.extension"))))
+    (dolist (ext magit-exts)
+      (let ((sym (intern (format "magit-%s-mode" ext))))
+        (when (fboundp sym)
+          (funcall sym 1))))))
 
 (define-derived-mode magit-mode magit-section-mode "Magit"
   "Parent major mode from which Magit major modes inherit.
@@ -633,6 +634,14 @@ The buffer's major-mode should derive from `magit-section-mode'."
                            `(list ',var ,form))
                          bindings))))
 
+(defmacro magit-setup-buffer-new (git-info mode &optional locked &rest bindings)
+  (declare (indent 2))
+  `(magit-setup-buffer-internal-new
+    ,git-info ,mode ,locked
+    ,(cons 'list (mapcar (pcase-lambda (`(,var ,form))
+                           `(list ',var ,form))
+                         bindings))))
+
 (defun magit-setup-buffer-internal ( mode locked bindings
                                      &optional buffer-or-name directory)
   (let* ((value   (and locked
@@ -652,6 +661,42 @@ The buffer's major-mode should derive from `magit-section-mode'."
       (setq magit-previous-section section)
       (when directory
         (setq default-directory directory))
+      (funcall mode)
+      (magit-xref-setup #'magit-setup-buffer-internal bindings)
+      (pcase-dolist (`(,var ,val) bindings)
+        (set (make-local-variable var) val))
+      (when created
+        (run-hooks 'magit-create-buffer-hook)))
+    (magit-display-buffer buffer)
+    (with-current-buffer buffer
+      (run-hooks 'magit-setup-buffer-hook)
+      (magit-refresh-buffer)
+      (when created
+        (run-hooks 'magit-post-create-buffer-hook)))
+    buffer))
+
+(defvar-local git-info-for-hooks nil)
+
+(defun magit-setup-buffer-internal-new ( git-info mode locked bindings
+                                     &optional buffer-or-name directory)
+  (let* ((value   (and locked
+                       (with-temp-buffer
+                         (pcase-dolist (`(,var ,val) bindings)
+                           (set (make-local-variable var) val))
+                         (let ((major-mode mode))
+                           (magit-buffer-value)))))
+         (buffer  (if buffer-or-name
+                      (get-buffer-create buffer-or-name)
+                    (magit-get-mode-buffer mode value)))
+         (section (and buffer (magit-current-section)))
+         (created (not buffer)))
+    (unless buffer
+      (setq buffer (magit-generate-new-buffer mode value (magit-git-info-get 'git-root git-info))))
+    (with-current-buffer buffer
+      (setq magit-previous-section section)
+      (when directory
+        (setq default-directory directory))
+      (setq-local git-info-for-hooks git-info)
       (funcall mode)
       (magit-xref-setup #'magit-setup-buffer-internal bindings)
       (pcase-dolist (`(,var ,val) bindings)
@@ -879,6 +924,43 @@ If a frame, then only consider buffers on that frame."
         ('visible               (seq-some #'f (visible-frame-list)))
         ((or 'selected 't)      (seq-some #'w (window-list (selected-frame))))
         ((guard (framep frame)) (seq-some #'w (window-list frame)))))))
+
+(defun magit-get-mode-buffer-new (topdir mode &optional value frame)
+  "Return buffer belonging to the current repository whose major-mode is MODE.
+
+If no such buffer exists then return nil.  Multiple buffers with
+the same major-mode may exist for a repository but only one can
+exist that hasn't been locked to its value.  Return that buffer
+\(or nil if there is no such buffer) unless VALUE is non-nil, in
+which case return the buffer that has been locked to that value.
+
+If FRAME is nil or omitted, then consider all buffers.  Otherwise
+  only consider buffers that are displayed in some live window
+  on some frame.
+If `all', then consider all buffers on all frames.
+If `visible', then only consider buffers on all visible frames.
+If `selected' or t, then only consider buffers on the selected
+  frame.
+If a frame, then only consider buffers on that frame."
+  (cl-flet* ((b (buffer)
+               (with-current-buffer buffer
+                 (and (eq major-mode mode)
+                      (equal magit--default-directory topdir)
+                      (if value
+                          (and magit-buffer-locked-p
+                               (equal (magit-buffer-value) value))
+                        (not magit-buffer-locked-p))
+                      buffer)))
+             (w (window)
+               (b (window-buffer window)))
+             (f (frame)
+               (seq-some #'w (window-list frame 'no-minibuf))))
+    (pcase-exhaustive frame
+      ('nil                   (seq-some #'b (buffer-list)))
+      ('all                   (seq-some #'f (frame-list)))
+      ('visible               (seq-some #'f (visible-frame-list)))
+      ((or 'selected 't)      (seq-some #'w (window-list (selected-frame))))
+      ((guard (framep frame)) (seq-some #'w (window-list frame))))))
 
 (defun magit-generate-new-buffer (mode &optional value directory)
   (let* ((default-directory (or directory (magit--toplevel-safe)))
@@ -1192,7 +1274,7 @@ is saved without asking, the user is asked about each modified
 buffer which visits a file in the current repository.  Optional
 argument (the prefix) non-nil means save all with no questions."
   (interactive "P")
-  (when-let ((topdir (magit-rev-parse-safe "--show-toplevel")))
+  (when-let ((topdir (if git-info-for-hooks (magit-git-info-get 'git-root git-info-for-hooks)(magit-rev-parse-safe "--show-toplevel"))))
     (let ((remote (file-remote-p default-directory))
           (save-some-buffers-action-alist
            `((?Y (lambda (buffer)

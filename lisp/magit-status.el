@@ -331,6 +331,13 @@ prefix arguments:
 
 (put 'magit-status 'interactive-only 'magit-status-setup-buffer)
 
+(defun magit-status-new ()
+  (interactive)
+  (require 'vc-git)
+  (if-let* ((git-root (vc-git-root default-directory)))
+      (magit-status-setup-buffer-new git-root)
+    (message "[magit] INFO: Not in git dir")))
+
 ;;;###autoload
 (defalias 'magit #'magit-status
   "Begin using Magit.
@@ -457,6 +464,46 @@ Type \\[magit-commit] to create a commit.
          (line (and file (save-restriction (widen) (line-number-at-pos))))
          (col  (and file (save-restriction (widen) (current-column))))
          (buf  (magit-setup-buffer #'magit-status-mode nil
+                 (magit-buffer-diff-args  (nth 0 d))
+                 (magit-buffer-diff-files (nth 1 d))
+                 (magit-buffer-log-args   (nth 0 l))
+                 (magit-buffer-log-files  (nth 1 l)))))
+    (when file
+      (with-current-buffer buf
+        (let ((staged (magit-get-section '((staged) (status)))))
+          (if (and staged
+                   (cadr (magit-diff--locate-hunk file line staged)))
+              (magit-diff--goto-position file line col staged)
+            (let ((unstaged (magit-get-section '((unstaged) (status)))))
+              (unless (and unstaged
+                           (magit-diff--goto-position file line col unstaged))
+                (when staged
+                  (magit-diff--goto-position file line col staged))))))))
+    buf))
+
+(defun magit-git-info-get (key info)
+  (alist-get key info))
+
+(defun magit-git-info (directory)
+  `(
+    (git-root . ,directory)
+    ;;  git --no-pager --literal-pathspecs -c core.preloadindex=true -c log.showSignature=false -c color.ui=false -c color.diff=false config -z --get-all --include magit.extension
+    (magit-extensions . nil)
+    ))
+
+;;;###autoload
+(defun magit-status-setup-buffer-new (directory)
+  (let* ((default-directory directory)
+         (git-info (magit-git-info default-directory))
+         (d (magit-diff--get-value-new git-info 'magit-status-mode
+                                   magit-status-use-buffer-arguments))
+         (l (magit-log--get-value-new git-info 'magit-status-mode
+                                  magit-status-use-buffer-arguments))
+         (file (and magit-status-goto-file-position
+                    (magit-file-relative-name)))
+         (line (and file (save-restriction (widen) (line-number-at-pos))))
+         (col  (and file (save-restriction (widen) (current-column))))
+         (buf  (magit-setup-buffer-new git-info #'magit-status-mode nil
                  (magit-buffer-diff-args  (nth 0 d))
                  (magit-buffer-diff-files (nth 1 d))
                  (magit-buffer-log-args   (nth 0 l))
