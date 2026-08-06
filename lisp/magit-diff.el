@@ -865,6 +865,33 @@ and `:slant'."
       (setq args (get mode 'magit-diff-default-arguments))))
     (list args files)))
 
+(defun magit-diff--get-value-new (git-info mode &optional use-buffer-args)
+  (unless use-buffer-args
+    (setq use-buffer-args magit-direct-use-buffer-arguments))
+  (let (args files)
+    (cond
+     ((and (memq use-buffer-args '(always selected current))
+           (eq major-mode mode))
+      (setq args  magit-buffer-diff-args)
+      (setq files magit-buffer-diff-files))
+     ((when-let (((memq use-buffer-args '(always selected)))
+                 (buffer (magit-get-mode-buffer-new
+                          (magit-git-info-get 'git-root git-info)
+                          mode nil
+                          (eq use-buffer-args 'selected))))
+        (setq args  (buffer-local-value 'magit-buffer-diff-args buffer))
+        (setq files (buffer-local-value 'magit-buffer-diff-files buffer))
+        t))
+     ((plist-member (symbol-plist mode) 'magit-diff-current-arguments)
+      (setq args (get mode 'magit-diff-current-arguments)))
+     ((when-let ((elt (assq (intern (format "magit-diff:%s" mode))
+                            transient-values)))
+        (setq args (cdr elt))
+        t))
+     (t
+      (setq args (get mode 'magit-diff-default-arguments))))
+    (list args files)))
+
 (defun magit-diff--set-value (obj &optional save)
   (pcase-let* ((obj  (oref obj prototype))
                (mode (or (oref obj major-mode) major-mode))
