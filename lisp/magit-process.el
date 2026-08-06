@@ -475,6 +475,8 @@ Similar to `process-file' but temporarily enable Cygwin's
                 (format-time-string magit-process-record-entry-format)
                 `((?d . ,(abbreviate-file-name default-directory))
                   (?a . ,(magit-process--format-arguments process args)))))))
+  ;; (message "WIP: magit-run: %s %s" process (mapconcat #'identity args " "))
+  ;; (message "WIP: %s" (with-output-to-string (backtrace)))
   (let ((process-environment (magit-process-environment))
         (default-process-coding-system (magit--process-coding-system)))
     (apply #'process-file process infile buffer display args)))
