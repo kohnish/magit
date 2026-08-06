@@ -424,6 +424,33 @@ commits before and half after."
       (setq args (get mode 'magit-log-default-arguments))))
     (list args files)))
 
+(defun magit-log--get-value-new (git-info mode &optional use-buffer-args)
+  (unless use-buffer-args
+    (setq use-buffer-args magit-direct-use-buffer-arguments))
+  (let (args files)
+    (cond
+     ((and (memq use-buffer-args '(always selected current))
+           (eq major-mode mode))
+      (setq args  magit-buffer-log-args)
+      (setq files magit-buffer-log-files))
+     ((when-let (((memq use-buffer-args '(always selected)))
+                 (buffer (magit-get-mode-buffer-new
+                          (magit-git-info-get 'git-root git-info)
+                          mode nil
+                          (eq use-buffer-args 'selected))))
+        (setq args  (buffer-local-value 'magit-buffer-log-args buffer))
+        (setq files (buffer-local-value 'magit-buffer-log-files buffer))
+        t))
+     ((plist-member (symbol-plist mode) 'magit-log-current-arguments)
+      (setq args (get mode 'magit-log-current-arguments)))
+     ((when-let ((elt (assq (intern (format "magit-log:%s" mode))
+                            transient-values)))
+        (setq args (cdr elt))
+        t))
+     (t
+      (setq args (get mode 'magit-log-default-arguments))))
+    (list args files)))
+
 (defun magit-log--set-value (obj &optional save)
   (pcase-let* ((obj  (oref obj prototype))
                (mode (or (oref obj major-mode) major-mode))
