@@ -527,6 +527,11 @@ Type \\[magit-commit] to create a commit.
   (magit-insert-section (status)
     (magit-run-section-hook 'magit-status-sections-hook)))
 
+(defun magit-status-refresh-buffer-new ()
+  ;; (magit-git-exit-code "update-index" "--refresh")
+  (magit-insert-section (status)
+    (magit-run-section-hook 'magit-status-sections-hook)))
+
 (defun magit-status-goto-initial-section ()
   "Jump to the section specified by `magit-status-initial-section'."
   (when-let ((section
