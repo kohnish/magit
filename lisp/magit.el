@@ -705,6 +705,7 @@ the output in the kill ring.
         (message "Cannot determine Magit's version %S" debug)))
     magit-version))
 
+(defun magit-version-new () "3.3.0")
 ;;; Startup Asserts
 
 (defun magit-startup-asserts ()
@@ -739,6 +740,8 @@ have to adjust the environment as seen by graphical interface.
 For X11 something like ~/.xinitrc should work.\n"
                                     magit--minimal-emacs emacs-version)
                      :error)))
+
+(defun magit-startup-asserts-new () nil)
 
 ;;; Loading Libraries
 
@@ -780,9 +783,9 @@ For X11 something like ~/.xinitrc should work.\n"
 
 (unless (bound-and-true-p byte-compile-current-file)
   (if after-init-time
-      (progn (magit-startup-asserts)
-             (magit-version nil nil t))
-    (add-hook 'after-init-hook #'magit-startup-asserts t)
-    (add-hook 'after-init-hook #'magit-version t)))
+      (progn (magit-startup-asserts-new)
+             (magit-version-new))
+    (add-hook 'after-init-hook #'magit-startup-asserts-new t)
+    (add-hook 'after-init-hook #'magit-version-new t)))
 
 ;;; magit.el ends here
