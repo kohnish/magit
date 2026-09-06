@@ -728,7 +728,7 @@ The buffer's major-mode should derive from `magit-section-mode'."
     (magit-display-buffer buffer)
     (with-current-buffer buffer
       (run-hooks 'magit-setup-buffer-hook)
-      (magit-refresh-buffer)
+      (magit-refresh-buffer-new)
       (when created
         (run-hooks 'magit-post-create-buffer-hook)))
     (setq git-info-for-hooks nil)
@@ -1161,6 +1161,54 @@ Run hooks `magit-pre-refresh-hook' and `magit-post-refresh-hook'."
   (interactive)
   (setq magit-refresh-start-time (current-time))
   (let ((refresh (intern (format "%s-refresh-buffer"
+                                 (substring (symbol-name major-mode) 0 -5))))
+        (magit--refresh-cache (or magit--refresh-cache (list (cons 0 0)))))
+    (when (functionp refresh)
+      (when magit-refresh-verbose
+        (message "Refreshing buffer `%s'..." (buffer-name)))
+      (let* ((buffer (current-buffer))
+             (windows (mapcan
+                       (lambda (window)
+                         (with-selected-window window
+                           (with-current-buffer buffer
+                             (and-let* ((section (magit-section-at)))
+                               `(( ,window
+                                   ,section
+                                   ,@(magit-section-get-relative-position
+                                      section)))))))
+                       ;; If it qualifies, then the selected window
+                       ;; comes first, but we want to handle it last
+                       ;; so that its `magit-section-movement-hook'
+                       ;; run can override the effects of other runs.
+                       (or (nreverse (get-buffer-window-list buffer nil t))
+                           (list (selected-window))))))
+        (deactivate-mark)
+        (setq magit-section-pre-command-section nil)
+        (setq magit-section-highlight-overlays nil)
+        (setq magit-section-highlighted-sections nil)
+        (setq magit-section-unhighlight-sections nil)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (save-excursion
+            (funcall refresh)))
+        (pcase-dolist (`(,window . ,args) windows)
+          (if (eq buffer (window-buffer window))
+              (with-selected-window window
+                (apply #'magit-section-goto-successor args))
+            (with-current-buffer buffer
+              (let ((magit-section-movement-hook nil))
+                (apply #'magit-section-goto-successor args)))))
+        (run-hooks 'magit-refresh-buffer-hook)
+        (magit-section-update-highlight)
+        (set-buffer-modified-p nil))
+      (when magit-refresh-verbose
+        (message "Refreshing buffer `%s'...done (%.3fs)" (buffer-name)
+                 (float-time (time-since magit-refresh-start-time)))))))
+
+(defun magit-refresh-buffer-new (&rest _ignore)
+  (interactive)
+  (setq magit-refresh-start-time (current-time))
+  (let ((refresh (intern (format "%s-refresh-buffer-new"
                                  (substring (symbol-name major-mode) 0 -5))))
         (magit--refresh-cache (or magit--refresh-cache (list (cons 0 0)))))
     (when (functionp refresh)
