@@ -1910,6 +1910,28 @@ uncommitted changes, nil otherwise."
             ,@(and (match-string 3 str) (list t)))
         (match-string 1 str)))))
 
+(defun magit-get-current-tag-v2 (git-info &optional rev with-distance)
+  "Return the closest tag reachable from REV.
+
+If optional REV is nil, then default to `HEAD'.
+If optional WITH-DISTANCE is non-nil then return (TAG COMMITS),
+if it is `dirty' return (TAG COMMIT DIRTY). COMMITS is the number
+of commits in `HEAD' but not in TAG and DIRTY is t if there are
+uncommitted changes, nil otherwise."
+  (and-let* ((str (if git-info
+                      (magit-info-get magit-info-tag-desc-enum git-info)
+                      (magit-git-str "describe" "--long" "--tags"
+                                     (and (eq with-distance 'dirty) "--dirty")
+                                     rev))))
+    (save-match-data
+      (string-match
+       "\\(.+\\)-\\(?:0[0-9]*\\|\\([0-9]+\\)\\)-g[0-9a-z]+\\(-dirty\\)?$" str)
+      (if with-distance
+          `(,(match-string 1 str)
+            ,(string-to-number (or (match-string 2 str) "0"))
+            ,@(and (match-string 3 str) (list t)))
+        (match-string 1 str)))))
+
 (defun magit-get-next-tag (&optional rev with-distance)
   "Return the closest tag from which REV is reachable.
 

@@ -17,6 +17,7 @@ typedef struct magit_res_T {
     kstring_t *upstream_branch;
     kstring_t *head_log_line;
     kstring_t *upstream_subj;
+    kstring_t *tag_desc;
 } magit_res_T;
 
 #include <msgpack.h>
@@ -31,6 +32,7 @@ enum MAGIT_RES_KEY {
     MAGIT_RES_KEY_HEAD_LOG_LINE,
     MAGIT_RES_KEY_UPSTREAM_BRANCH,
     MAGIT_RES_KEY_UPSTREAM_SUBJ,
+    MAGIT_RES_KEY_TAG_DESC,
 };
 
 int msgpack_handler_recv(uv_loop_t *loop, const char *data, size_t len);

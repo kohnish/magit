@@ -29,7 +29,7 @@ static msgpack_sbuffer msgpack_handler_buf_create(magit_res_T *res) {
     msgpack_sbuffer_init(&buf);
     msgpack_packer packer;
     msgpack_packer_init(&packer, &buf, msgpack_sbuffer_write);
-    msgpack_pack_map(&packer, 8);
+    msgpack_pack_map(&packer, 9);
     append_key_val_int(&packer, MAGIT_RES_KEY_ID, res->id);
     append_key_val_str(&packer, MAGIT_RES_KEY_GIT_ROOT, res->git_root);
     append_key_val_str(&packer, MAGIT_RES_KEY_REV_HEAD, res->rev_head);
@@ -38,6 +38,7 @@ static msgpack_sbuffer msgpack_handler_buf_create(magit_res_T *res) {
     append_key_val_str(&packer, MAGIT_RES_KEY_HEAD_LOG_LINE, res->head_log_line);
     append_key_val_str(&packer, MAGIT_RES_KEY_UPSTREAM_BRANCH, res->upstream_branch);
     append_key_val_str(&packer, MAGIT_RES_KEY_UPSTREAM_SUBJ, res->upstream_subj);
+    append_key_val_str(&packer, MAGIT_RES_KEY_TAG_DESC, res->tag_desc);
     return buf;
 }
 

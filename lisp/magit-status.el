@@ -500,6 +500,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-head-log-line-enum 6)
 (defconst magit-info-upstream-branch-enum 7)
 (defconst magit-info-upstream-subj-enum 8)
+(defconst magit-info-tag-desc-enum 9)
 
 (defun magit-info-get (key info)
   (when info
@@ -756,7 +757,7 @@ arguments are for internal use only."
 
 (defun magit-insert-tags-header ()
   "Insert a header line about the current and/or next tag."
-  (let* ((this-tag (magit-get-current-tag nil t))
+  (let* ((this-tag (magit-get-current-tag-v2 git-info-for-hooks nil t))
          (next-tag (magit-get-next-tag nil t))
          (this-cnt (cadr this-tag))
          (next-cnt (cadr next-tag))

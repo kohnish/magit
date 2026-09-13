@@ -15,6 +15,7 @@ typedef struct {
     kstring_t *head_log_line;
     kstring_t *subj;
     kstring_t *upstream_subj;
+    kstring_t *tag_desc;
     int result;
 } git_root_req_T;
 
@@ -55,6 +56,38 @@ static void git_root_request_cleanup(git_root_req_T **req) {
 };
 
 #define GIT_ROOT_REQUEST_CLEANUP __attribute__((cleanup(git_root_request_cleanup)))
+
+static int get_tag_desc(git_repository *repo, kstring_t *out) {
+    git_object *head = NULL;
+    git_describe_result *result = NULL;
+    git_describe_options opts = GIT_DESCRIBE_OPTIONS_INIT;
+    git_describe_format_options fmt = GIT_DESCRIBE_FORMAT_OPTIONS_INIT;
+    git_buf buf = GIT_BUF_INIT;
+    int ret;
+
+    ret = git_revparse_single(&head, repo, "HEAD");
+    if (ret < 0)
+        return ret;
+
+    opts.describe_strategy = GIT_DESCRIBE_TAGS;
+
+    ret = git_describe_commit(&result, head, &opts);
+    git_object_free(head);
+
+    if (ret < 0)
+        return ret;
+
+    fmt.always_use_long_format = 1;
+
+    ret = git_describe_format(&buf, result, &fmt);
+    if (ret == 0)
+        kputs(buf.ptr, out);
+
+    git_buf_dispose(&buf);
+    git_describe_result_free(result);
+
+    return ret;
+}
 
 static int get_branch_upstream_name(git_repository *repo, const char *branch_name, kstring_t *out) {
     git_reference *branch = NULL;
@@ -218,6 +251,12 @@ static void git_root_worker(uv_work_t *req) {
         return;
     }
 
+    data->tag_desc = str_create(NULL, 0);
+    int tag_desc_ret = get_tag_desc(g_repo, data->tag_desc);
+    if (tag_desc_ret != 0) {
+        return;
+    }
+
     data->upstream_subj = str_create(NULL, 0);
     char target_str[] = "refs/remotes/";
     STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
@@ -247,7 +286,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .branch = data->branch,
         .upstream_branch = data->upstream_branch,
         .head_log_line = data->head_log_line,
-        .upstream_subj = data->upstream_subj
+        .upstream_subj = data->upstream_subj,
+        .tag_desc = data->tag_desc
     };
     msgpack_handler_send(&res);
 }
