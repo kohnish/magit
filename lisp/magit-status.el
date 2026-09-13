@@ -499,6 +499,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-branch-enum 5)
 (defconst magit-info-head-log-line-enum 6)
 (defconst magit-info-upstream-branch-enum 7)
+(defconst magit-info-upstream-subj-enum 8)
 
 (defun magit-info-get (key info)
   (when info
@@ -673,6 +674,12 @@ instead.  The optional BRANCH argument is for internal use only."
           (insert (magit-log--wash-summary summary))
           (insert ?\n))))))
 
+;; WIP: upstream subj
+(defun magit-upstream-subj (git-info &optional upstream)
+  (if git-info-for-hooks
+      (magit-info-get magit-info-upstream-subj-enum git-info)
+    (magit-rev-format "%s" upstream)))
+
 (defun magit-insert-upstream-branch-header (&optional branch upstream keyword)
   "Insert a header line about the upstream of the current branch.
 If no branch is checked out, then insert nothing.  The optional
@@ -698,7 +705,7 @@ arguments are for internal use only."
                                     " "))
                        upstream " "
                        (magit-log--wash-summary
-                        (or (magit-rev-format "%s" upstream)
+                        (or (magit-upstream-subj git-info-for-hooks upstream)
                             "(no commit message)")))
              (cond
               ((magit--unnamed-upstream-p remote merge)

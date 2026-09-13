@@ -13,6 +13,8 @@ typedef struct {
     kstring_t *branch;
     kstring_t *upstream_branch;
     kstring_t *head_log_line;
+    kstring_t *subj;
+    kstring_t *upstream_subj;
     int result;
 } git_root_req_T;
 
@@ -40,9 +42,13 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->branch->s);
             free((*req)->branch);
         }
-        if ((*req)->head_log_line) {
-            free((*req)->head_log_line->s);
-            free((*req)->head_log_line);
+        if ((*req)->upstream_subj) {
+            free((*req)->upstream_subj->s);
+            free((*req)->upstream_subj);
+        }
+        if ((*req)->subj) {
+            free((*req)->subj->s);
+            free((*req)->subj);
         }
         free(*req);
     }
@@ -73,13 +79,13 @@ static int get_branch_upstream_name(git_repository *repo, const char *branch_nam
     return ret;
 }
 
-static int git_head_subject(git_repository *repo, kstring_t *out) {
+static int git_head_subject(git_repository *repo, kstring_t *out, const char *target) {
     git_reference *head = NULL;
     git_object *obj = NULL;
     git_commit *commit = NULL;
     int error;
 
-    error = git_reference_lookup(&head, repo, "HEAD");
+    error = git_reference_lookup(&head, repo, target);
     if (error != 0)
         return error;
 
@@ -197,8 +203,8 @@ static void git_root_worker(uv_work_t *req) {
     int list_z_ret = git_config_list_z(g_repo, data->list_z);
 
     data->head_log_line = str_create(NULL, 0);
-    STR_CLEANUP kstring_t *tmp_subj = str_create(NULL, 0);
-    int subj_ret = git_head_subject(g_repo, tmp_subj);
+    data->subj = str_create(NULL, 0);
+    int subj_ret = git_head_subject(g_repo, data->subj, "HEAD");
 
     data->branch = str_create(NULL, 0);
     int branch_ret = git_symbolic_ref_short_head(g_repo, data->branch);
@@ -208,13 +214,22 @@ static void git_root_worker(uv_work_t *req) {
 
     data->upstream_branch = str_create(NULL, 0);
     int upstream_branch_ret = get_branch_upstream_name(g_repo, data->branch->s, data->upstream_branch);
+    if (upstream_branch_ret != 0) {
+        return;
+    }
 
-    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_branch_ret == 0) {
+    data->upstream_subj = str_create(NULL, 0);
+    char target_str[] = "refs/remotes/";
+    STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
+    kputs(data->upstream_branch->s, target);
+    int upstream_subj_ret = git_head_subject(g_repo, data->upstream_subj, target->s);
+
+    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0) {
         data->root = str_create(root, strlen(root));
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
         kputs(data->rev_head->s, data->head_log_line);
         kputs(" ", data->head_log_line);
-        kputs(tmp_subj->s, data->head_log_line);
+        kputs(data->subj->s, data->head_log_line);
         data->result = 0;
     }
 }
@@ -231,7 +246,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .list_z = data->list_z,
         .branch = data->branch,
         .upstream_branch = data->upstream_branch,
-        .head_log_line = data->head_log_line
+        .head_log_line = data->head_log_line,
+        .upstream_subj = data->upstream_subj
     };
     msgpack_handler_send(&res);
 }
