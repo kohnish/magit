@@ -497,10 +497,11 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-magit-extensions-enum 3)
 (defconst magit-info-list-z-enum 4)
 (defconst magit-info-branch-enum 5)
+(defconst magit-info-head-log-line-enum 6)
 
 (defun magit-info-get (key info)
   (when info
-    (message (format "WIP: cached git get for %i" key))
+    ;; (message (format "WIP: cached git get for %i" key))
     (alist-get key info)))
 
 (defun magit-status-setup-buffer-cb (git-info)
@@ -640,12 +641,17 @@ the status buffer causes this section to disappear again."
       (magit-info-get magit-info-branch-enum git-info)
     (magit-get-current-branch)))
 
+(defun magit-rev-format-head-log-line (git-info)
+  (if git-info
+      (magit-info-get magit-info-head-log-line-enum git-info)
+  (magit-rev-format "%h %s" "HEAD")))
+
 (defun magit-insert-head-branch-header (&optional branch)
   "Insert a header line about the current branch.
 If `HEAD' is detached, then insert information about that commit
 instead.  The optional BRANCH argument is for internal use only."
   (let ((branch (or branch (magit-get-current-branch-v2 git-info-for-hooks)))
-        (output (magit-rev-format "%h %s" (or branch "HEAD"))))
+        (output (magit-rev-format-head-log-line git-info-for-hooks)))
     (string-match "^\\([^ ]+\\) \\(.*\\)" output)
     (magit-bind-match-strings (commit summary) output
       (when (equal summary "")

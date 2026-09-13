@@ -11,6 +11,7 @@ typedef struct {
     kstring_t *rev_head;
     kstring_t *list_z;
     kstring_t *branch;
+    kstring_t *head_log_line;
     int result;
 } git_root_req_T;
 
@@ -34,11 +35,44 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->list_z->s);
             free((*req)->list_z);
         }
+        if ((*req)->branch) {
+            free((*req)->branch->s);
+            free((*req)->branch);
+        }
+        if ((*req)->head_log_line) {
+            free((*req)->head_log_line->s);
+            free((*req)->head_log_line);
+        }
         free(*req);
     }
 };
 
 #define GIT_ROOT_REQUEST_CLEANUP __attribute__((cleanup(git_root_request_cleanup)))
+
+static int git_head_subject(git_repository *repo, kstring_t *out) {
+    git_reference *head = NULL;
+    git_object *obj = NULL;
+    git_commit *commit = NULL;
+    int error;
+
+    error = git_reference_lookup(&head, repo, "HEAD");
+    if (error != 0)
+        return error;
+
+    error = git_reference_peel(&obj, head, GIT_OBJECT_COMMIT);
+    git_reference_free(head);
+
+    if (error != 0)
+        return error;
+
+    commit = (git_commit *)obj;
+
+    kputs(git_commit_summary(commit), out);
+
+    git_commit_free(commit);
+
+    return 0;
+}
 
 static int git_symbolic_ref_short_head(git_repository *repo, kstring_t *out) {
     git_reference *head_ref = NULL;
@@ -134,13 +168,22 @@ static void git_root_worker(uv_work_t *req) {
     const char *root = git_repository_workdir(g_repo);
     char oid_str[GIT_OID_MAX_HEXSIZE];
     int rev_ret = git_rev_head(g_repo, oid_str);
+
     data->list_z = str_create(NULL, 0);
     int list_z_ret = git_config_list_z(g_repo, data->list_z);
+
     data->branch = str_create(NULL, 0);
     int branch_ret = git_symbolic_ref_short_head(g_repo, data->branch);
-    if (root && rev_ret == 0 && list_z_ret == 0 && branch_ret == 0) {
+
+    data->head_log_line = str_create(NULL, 0);
+    STR_CLEANUP kstring_t *tmp_subj = str_create(NULL, 0);
+    int subj_ret = git_head_subject(g_repo, tmp_subj);
+    if (root && rev_ret == 0 && list_z_ret == 0 && branch_ret == 0 && subj_ret == 0) {
         data->root = str_create(root, strlen(root));
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
+        kputs(data->rev_head->s, data->head_log_line);
+        kputs(" ", data->head_log_line);
+        kputs(tmp_subj->s, data->head_log_line);
         data->result = 0;
     } else {
         // Bare repository
@@ -158,7 +201,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .git_root = data->root,
         .rev_head = data->rev_head,
         .list_z = data->list_z,
-        .branch = data->branch
+        .branch = data->branch,
+        .head_log_line = data->head_log_line
     };
     msgpack_handler_send(&res);
 }

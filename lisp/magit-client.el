@@ -95,9 +95,9 @@
          (buffer (concat (magit-server-get-buffer git-root)
                          chunk)))
 
-    (message "[%s] received %d bytes"
-             git-root
-             (length chunk))
+    ;; (message "[%s] received %d bytes"
+    ;;          git-root
+    ;;          (length chunk))
 
     (catch 'magit-server-filter-done
       (while (>= (length buffer) 4)
@@ -113,9 +113,9 @@
             (let* ((payload (substring buffer 4 (+ 4 len)))
                    (remaining (substring buffer (+ 4 len)))
                    (msg (msgpack-read-from-string payload)))
-              (message "[%s] decoded: %S"
-                       git-root
-                       msg)
+              ;; (message "[%s] decoded: %S"
+              ;;          git-root
+              ;;          msg)
               (let* ((request-id (cdr (assq 0 msg)))
                      (callback
                       (and request-id

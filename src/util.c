@@ -15,6 +15,18 @@ kstring_t *str_create(const char *data, int len) {
     return s;
 }
 
+kstring_t *str_cat_xfer(kstring_t *s1, kstring_t *s2, const char *delimiter) {
+    if (delimiter)
+        kputs(delimiter, s1);
+
+    kputsn(s2->s, s2->l, s1);
+
+    free(s2->s);
+    free(s2);
+
+    return s1;
+}
+
 void free_ptr(void *p) {
     void **ptr = p;
 
