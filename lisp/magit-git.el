@@ -1707,6 +1707,18 @@ according to the branch type."
                     'magit-branch-local
                   'magit-branch-remote)))))
 
+(defun magit-get-upstream-branch-v2 (git-info &optional branch)
+  (if git-info
+      (magit-info-get magit-info-upstream-branch-enum git-info)
+  (magit--with-refresh-cache
+      (list default-directory 'magit-get-upstream-branch branch)
+    (and-let* ((branch (or branch (magit-get-current-branch)))
+               (upstream (magit-ref-abbrev (concat branch "@{upstream}"))))
+      (magit--propertize-face
+       upstream (if (equal (magit-get "branch" branch "remote") ".")
+                    'magit-branch-local
+                  'magit-branch-remote))))))
+
 (defun magit-get-indirect-upstream-branch (branch &optional force)
   (let ((remote (magit-get "branch" branch "remote")))
     (and remote (not (equal remote "."))

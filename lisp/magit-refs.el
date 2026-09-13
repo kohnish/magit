@@ -652,7 +652,7 @@ line is inserted at all."
                                     "%00%00%00%(subject)"))
                           "refs/heads"
                           magit-buffer-arguments))))
-    (unless (magit-get-current-branch)
+    (unless (magit-get-current-branch-v2 git-info-for-hooks)
       (push (magit-refs--format-local-branch
              (concat "*\0\0\0\0\0\0\0\0" (magit-rev-format "%s")))
             lines))

@@ -498,6 +498,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-list-z-enum 4)
 (defconst magit-info-branch-enum 5)
 (defconst magit-info-head-log-line-enum 6)
+(defconst magit-info-upstream-branch-enum 7)
 
 (defun magit-info-get (key info)
   (when info
@@ -682,7 +683,7 @@ arguments are for internal use only."
           (rebase (magit-get "branch" branch "rebase")))
       (when (or remote merge)
         (unless upstream
-          (setq upstream (magit-get-upstream-branch branch)))
+          (setq upstream (magit-get-upstream-branch-v2 git-info-for-hooks branch)))
         (magit-insert-section (branch upstream)
           (pcase rebase
             ("true")
