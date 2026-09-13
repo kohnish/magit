@@ -7,7 +7,7 @@ enum ERR {
 };
 
 enum MSGKEY {
-    MSGKEY_ID_UINT = 1,
+    MSGKEY_ID_UINT = 0,
     MSGKEY_CMD_UINT,
     MSGKEY_PWD_STR,
 };

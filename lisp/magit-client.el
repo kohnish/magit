@@ -1,6 +1,7 @@
 ;; -*- lexical-binding: t; -*-
 
 (require 'msgpack)
+(require 'cl-lib)
 
 (defvar magit-server-processes nil)
 (defvar magit-server-buffers nil)
@@ -32,6 +33,11 @@
   (setf (alist-get git-root magit-server-buffers nil nil #'equal)
         buffer))
 
+(defun magit-server-sentinel (process event git-root)
+  (when (memq (process-status process) '(exit signal))
+    (magit-server-set-buffer git-root nil)
+    (magit-server-set-process git-root nil)))
+
 (defun magit-server-start (git-root)
   (or (magit-server-get-process git-root)
       (let ((process
@@ -42,7 +48,8 @@
                 :coding 'binary
                 :connection-type 'pipe
                 :filter #'magit-server-filter
-                :sentinel #'magit-server-sentinel))))
+                :sentinel (lambda (process event)
+                            (magit-server-sentinel process event git-root))))))
         (process-put process 'git-root git-root)
         (magit-server-set-process git-root process)
         (magit-server-set-buffer git-root "")
@@ -100,59 +107,58 @@
                       (aref buffer 3))))
 
           (if (< (length buffer) (+ 4 len))
-              ;; Wait for more data.
               (progn
                 (magit-server-set-buffer git-root buffer)
                 (throw 'magit-server-filter-done nil))
-
             (let* ((payload (substring buffer 4 (+ 4 len)))
                    (remaining (substring buffer (+ 4 len)))
                    (msg (msgpack-read-from-string payload)))
-
               (message "[%s] decoded: %S"
                        git-root
                        msg)
-
               (let* ((request-id (cdr (assq 0 msg)))
                      (callback
                       (and request-id
                            (magit-server-find-callback
                             process
                             request-id))))
-
-                (if callback
-                    (funcall callback msg)
-                  (message "magit-server: no pending callback for request-id %s; discarding message: %S"
-                           request-id msg)))
-
+                (when request-id (cl-assert callback))
+                (funcall callback msg))
               (setq buffer remaining))))))
-
     (magit-server-set-buffer git-root buffer)))
 
-
-(defvar test-msg-id 0)
-
-(cl-defun make-test-msg (&key cmd-id default-dir)
+(cl-defun make-magit-status-msg (&key cmd-id default-dir)
   (list
-   (cons 1 (prog1 test-msg-id (setq test-msg-id (1+ test-msg-id))))
-   (cons 2 cmd-id)
-   (cons 3 default-dir)))
+   (cons 1 cmd-id)
+   (cons 2 default-dir)))
 
-(defun test-msg ()
-  (list
-   (cons 1 1)
-   (cons 2 1)
-   (cons 3 (expand-file-name "~/.emacs.d/elpa/magit/src"))))
-
-
-(defun test-send-async ()
+(defun magit-status-req-test ()
   (let ((root (expand-file-name "~/.emacs.d/elpa/magit")))
     (require 'magit-client)
     (magit-server-start root)
     (magit-server-send-async
      root
-     (make-test-msg :cmd-id 1 :default-dir default-directory)
+     (make-magit-status-msg :cmd-id 1 :default-dir default-directory)
      (lambda (response)
        (message "ASYNC RESPONSE: %S" response)))))
+
+;; (defun magit-status-req (root callback)
+;;   (require 'magit-client)
+;;   (magit-server-start root)
+;;   (magit-server-send-async
+;;    root
+;;    (make-magit-status-msg
+;;     :cmd-id 1
+;;     :default-dir default-directory)
+;;    callback))
+
+(defun magit-status-req (root callback)
+  (let ((root (expand-file-name "~/.emacs.d/elpa/magit")))
+    (require 'magit-client)
+    (magit-server-start root)
+    (magit-server-send-async
+     root
+     (make-magit-status-msg :cmd-id 1 :default-dir default-directory)
+     callback)))
 
 (provide 'magit-client)

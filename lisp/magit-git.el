@@ -714,7 +714,8 @@ See info node `(magit)Debugging Tools' for more information."
    (let* ((key (replace-regexp-in-string "\\`[^.]+" #'downcase key t t))
           (key (replace-regexp-in-string "[^.]+\\'" #'downcase key t t)))
      key)
-   (magit--with-refresh-cache (cons (magit-toplevel) 'config)
+   ;; WIP: top-level 2
+   (magit--with-refresh-cache (cons (magit-top-level git-info-for-hooks) 'config)
      (let ((configs (make-hash-table :test #'equal)))
        (dolist (conf (magit-git-items "config" "--list" "-z"))
          (let* ((nl-pos (cl-position ?\n conf))

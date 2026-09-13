@@ -481,34 +481,39 @@ Type \\[magit-commit] to create a commit.
                   (magit-diff--goto-position file line col staged))))))))
     buf))
 
-(defun magit-git-info-get (key info)
+
+
+;; WIP: git-info
+;; (defun magit-git-info (directory)
+;;   `(
+;;     (git-root . ,directory)
+;;     ;; git --no-pager --literal-pathspecs -c core.preloadindex=true -c log.showSignature=false -c color.ui=false -c color.diff=false config -z --get-all --include magit.extension
+;;     (magit-extensions . nil)
+;;     ;; git --no-pager --literal-pathspecs -c core.preloadindex=true -c log.showSignature=false -c color.ui=false -c color.diff=false rev-parse --verify HEAD
+;;     (head . "090834334dff53ff01eb176f2650bc91e4650d33")
+;;     ))
+(defconst magit-info-root-enum 1)
+(defconst magit-info-head-enum 2)
+(defconst magit-info-magit-extensions-enum 3)
+(defun magit-info-get (key info)
   (when info
     (alist-get key info)))
 
-(defun magit-git-info (directory)
-  `(
-    (git-root . ,directory)
-    ;;  git --no-pager --literal-pathspecs -c core.preloadindex=true -c log.showSignature=false -c color.ui=false -c color.diff=false config -z --get-all --include magit.extension
-    (magit-extensions . nil)
-    ))
-
-;;;###autoload
-(defun magit-status-setup-buffer-new (directory)
-  (let* ((default-directory directory)
-         (git-info (magit-git-info default-directory))
+(defun magit-status-setup-buffer-cb (git-info)
+  (let* ((default-directory (magit-info-get magit-info-root-enum git-info))
          (d (magit-diff--get-value-new git-info 'magit-status-mode
-                                   magit-status-use-buffer-arguments))
+                                       magit-status-use-buffer-arguments))
          (l (magit-log--get-value-new git-info 'magit-status-mode
-                                  magit-status-use-buffer-arguments))
+                                      magit-status-use-buffer-arguments))
          (file (and magit-status-goto-file-position
                     (magit-file-relative-name)))
          (line (and file (save-restriction (widen) (line-number-at-pos))))
          (col  (and file (save-restriction (widen) (current-column))))
          (buf  (magit-setup-buffer-new git-info #'magit-status-mode nil
-                 (magit-buffer-diff-args  (nth 0 d))
-                 (magit-buffer-diff-files (nth 1 d))
-                 (magit-buffer-log-args   (nth 0 l))
-                 (magit-buffer-log-files  (nth 1 l)))))
+                                       (magit-buffer-diff-args  (nth 0 d))
+                                       (magit-buffer-diff-files (nth 1 d))
+                                       (magit-buffer-log-args   (nth 0 l))
+                                       (magit-buffer-log-files  (nth 1 l)))))
     (when file
       (with-current-buffer buf
         (let ((staged (magit-get-section '((staged) (status)))))
@@ -521,6 +526,11 @@ Type \\[magit-commit] to create a commit.
                 (when staged
                   (magit-diff--goto-position file line col staged))))))))
     buf))
+
+;; ;;;###autoload
+(defun magit-status-setup-buffer-new (git-root)
+  (require 'magit-client)
+  (magit-status-req git-root #'magit-status-setup-buffer-cb))
 
 (defun magit-status-refresh-buffer ()
   (magit-git-exit-code "update-index" "--refresh")
@@ -569,11 +579,17 @@ If there is no blob buffer in the same frame, then do nothing."
 ;;; Sections
 ;;;; Special Headers
 
+;; WIP: verify-head
+(defun magit-verify-head (git-info)
+  (if git-info
+      (magit-info-get magit-info-head-enum git-info)
+    (magit-rev-verify "HEAD")))
+
 (defun magit-insert-status-headers ()
   "Insert header sections appropriate for `magit-status-mode' buffers.
 The sections are inserted by running the functions on the hook
 `magit-status-headers-hook'."
-  (if (magit-rev-verify "HEAD")
+  (if (magit-verify-head git-info-for-hooks)
       (magit-insert-headers 'magit-status-headers-hook)
     (insert "In the beginning there was darkness\n\n")))
 

@@ -24,15 +24,20 @@ static void append_key_val_int(msgpack_packer *packer, enum MAGIT_RES_KEY key, u
     msgpack_pack_int(packer, val);
 }
 
-msgpack_sbuffer msgpack_handler_buf_create(magit_res_T *res) {
+static msgpack_sbuffer msgpack_handler_buf_create(magit_res_T *res) {
     msgpack_sbuffer buf;
     msgpack_sbuffer_init(&buf);
     msgpack_packer packer;
     msgpack_packer_init(&packer, &buf, msgpack_sbuffer_write);
-    msgpack_pack_map(&packer, 2);
+    msgpack_pack_map(&packer, 3);
 
     append_key_val_int(&packer, MAGIT_RES_KEY_ID, res->id);
+
+    FILE *fp = fopen("/var/tmp/log", "a");
+    fprintf(fp, "WIP: sending %lu\n", res->id);
+    fclose(fp);
     append_key_val_str(&packer, MAGIT_RES_KEY_GIT_ROOT, res->git_root);
+    append_key_val_str(&packer, MAGIT_RES_KEY_REV_HEAD, res->rev_head);
     return buf;
 }
 
@@ -149,6 +154,10 @@ int msgpack_handler_recv(uv_loop_t *loop, const char *data, size_t len) {
             break;
         };
     }
+
+    FILE *fp = fopen("/var/tmp/log", "a");
+    fprintf(fp, "WIP: received %lu\n", id);
+    fclose(fp);
 
     if (id != 0 && cmd != 0) {
         switch ((enum CMD)cmd) {

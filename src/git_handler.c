@@ -7,12 +7,13 @@ typedef struct {
     uint64_t id;
     kstring_t *pwd;
     kstring_t *root;
+    kstring_t *rev_head;
     int result;
-} git_root_request_t;
+} git_root_req_T;
 
 git_repository *g_repo = NULL;
 
-static void git_root_request_cleanup(git_root_request_t **req) {
+static void git_root_request_cleanup(git_root_req_T **req) {
     if (req && *req) {
         if ((*req)->pwd) {
             free((*req)->pwd->s);
@@ -22,17 +23,40 @@ static void git_root_request_cleanup(git_root_request_t **req) {
             free((*req)->root->s);
             free((*req)->root);
         }
+        if ((*req)->rev_head) {
+            free((*req)->rev_head->s);
+            free((*req)->rev_head);
+        }
         free(*req);
     }
 };
 
 #define GIT_ROOT_REQUEST_CLEANUP __attribute__((cleanup(git_root_request_cleanup)))
 
+static int git_rev_head(git_repository *repo, char result_buf[GIT_OID_MAX_HEXSIZE]) {
+    git_reference *head = NULL;
+    int error = git_repository_head(&head, repo);
+    if (error != 0) {
+        return error;
+    }
+    const git_oid *oid = git_reference_target(head);
+    if (oid == NULL) {
+        git_reference_free(head);
+        return -1;
+    }
+    git_oid_tostr(result_buf, GIT_OID_MAX_HEXSIZE + 1, oid);
+    git_reference_free(head);
+    return 0;
+}
+
 static void git_root_worker(uv_work_t *req) {
-    git_root_request_t *data = req->data;
+    git_root_req_T *data = req->data;
     const char *root = git_repository_workdir(g_repo);
-    if (root) {
+    char oid_str[GIT_OID_MAX_HEXSIZE];
+    int rev_ret = git_rev_head(g_repo, oid_str);
+    if (root && rev_ret == 0) {
         data->root = str_create(root, strlen(root));
+        data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
         data->result = 0;
     } else {
         // Bare repository
@@ -41,16 +65,16 @@ static void git_root_worker(uv_work_t *req) {
 }
 
 static void after_git_root(uv_work_t *req, int status) {
-    GIT_ROOT_REQUEST_CLEANUP git_root_request_t *data = req->data;
+    GIT_ROOT_REQUEST_CLEANUP git_root_req_T *data = req->data;
     if (status != 0 || data->result < 0) {
         return;
     }
-    magit_res_T res = {.id = data->id, .git_root = data->root};
+    magit_res_T res = {.id = data->id, .git_root = data->root, .rev_head = data->rev_head};
     msgpack_handler_send(&res);
 }
 
 int git_handler_queue_git_status(uv_loop_t *loop, u_int64_t id, kstring_t *pwd) {
-    GIT_ROOT_REQUEST_CLEANUP git_root_request_t *data = malloc(sizeof(*data));
+    GIT_ROOT_REQUEST_CLEANUP git_root_req_T *data = malloc(sizeof(*data));
     data->pwd = pwd;
     data->root = NULL;
     data->id = id;

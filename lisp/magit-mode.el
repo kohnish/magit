@@ -710,11 +710,11 @@ The buffer's major-mode should derive from `magit-section-mode'."
                            (magit-buffer-value)))))
          (buffer  (if buffer-or-name
                       (get-buffer-create buffer-or-name)
-                    (magit-get-mode-buffer-new (magit-git-info-get 'git-root git-info) mode value)))
+                    (magit-get-mode-buffer-new (magit-info-get magit-info-root-enum git-info) mode value)))
          (section (and buffer (magit-current-section)))
          (created (not buffer)))
     (unless buffer
-      (setq buffer (magit-generate-new-buffer mode value (magit-git-info-get 'git-root git-info))))
+      (setq buffer (magit-generate-new-buffer mode value (magit-info-get magit-info-root-enum git-info))))
     (with-current-buffer buffer
       (setq magit-previous-section section)
       (when directory
@@ -1338,8 +1338,9 @@ if you so desire."
 
 (defvar-local magit-inhibit-refresh-save nil)
 
+;; WIP: toplevel func
 (defun magit-top-level (git-info)
-  (if-let ((root (magit-git-info-get 'git-root git-info)))
+  (if-let ((root (magit-info-get magit-info-root-enum git-info)))
     root
     (magit-rev-parse-safe "--show-toplevel")))
 

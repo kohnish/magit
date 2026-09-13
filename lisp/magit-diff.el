@@ -876,7 +876,7 @@ and `:slant'."
       (setq files magit-buffer-diff-files))
      ((when-let (((memq use-buffer-args '(always selected)))
                  (buffer (magit-get-mode-buffer-new
-                          (magit-git-info-get 'git-root git-info)
+                          (magit-info-get magit-info-root-enum git-info)
                           mode nil
                           (eq use-buffer-args 'selected))))
         (setq args  (buffer-local-value 'magit-buffer-diff-args buffer))
