@@ -677,7 +677,7 @@ instead.  The optional BRANCH argument is for internal use only."
   "Insert a header line about the upstream of the current branch.
 If no branch is checked out, then insert nothing.  The optional
 arguments are for internal use only."
-  (when-let ((branch (or branch (magit-get-current-branch))))
+  (when-let ((branch (or branch (magit-get-current-branch-v2 git-info-for-hooks))))
     (let ((remote (magit-get "branch" branch "remote"))
           (merge  (magit-get "branch" branch "merge"))
           (rebase (magit-get "branch" branch "rebase")))
@@ -724,7 +724,7 @@ arguments are for internal use only."
 
 (defun magit-insert-push-branch-header ()
   "Insert a header line about the branch the current branch is pushed to."
-  (when-let* ((branch (magit-get-current-branch))
+  (when-let* ((branch (magit-get-current-branch-v2 git-info-for-hooks))
               (target (magit-get-push-branch branch)))
     (magit-insert-section (branch target)
       (insert (format "%-10s" "Push: "))
