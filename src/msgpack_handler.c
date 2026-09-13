@@ -29,15 +29,11 @@ static msgpack_sbuffer msgpack_handler_buf_create(magit_res_T *res) {
     msgpack_sbuffer_init(&buf);
     msgpack_packer packer;
     msgpack_packer_init(&packer, &buf, msgpack_sbuffer_write);
-    msgpack_pack_map(&packer, 3);
-
+    msgpack_pack_map(&packer, 4);
     append_key_val_int(&packer, MAGIT_RES_KEY_ID, res->id);
-
-    FILE *fp = fopen("/var/tmp/log", "a");
-    fprintf(fp, "WIP: sending %lu\n", res->id);
-    fclose(fp);
     append_key_val_str(&packer, MAGIT_RES_KEY_GIT_ROOT, res->git_root);
     append_key_val_str(&packer, MAGIT_RES_KEY_REV_HEAD, res->rev_head);
+    append_key_val_str(&packer, MAGIT_RES_KEY_LIST_Z, res->list_z);
     return buf;
 }
 

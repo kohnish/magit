@@ -707,6 +707,14 @@ See info node `(magit)Debugging Tools' for more information."
                           (magit--safe-git-version))))))))
 
 ;;; Variables
+;; WIP: list-z
+(defun magit-parse-config-list-z (raw)
+  (split-string raw "\0" t))
+
+(defun magit-list-z (git-info)
+  (if git-info
+      (magit-parse-config-list-z (magit-info-get magit-info-list-z-enum git-info))
+      (magit-git-items "config" "--list" "-z")))
 
 (defun magit-config-get-from-cached-list (key)
   (gethash
@@ -717,7 +725,8 @@ See info node `(magit)Debugging Tools' for more information."
    ;; WIP: top-level 2
    (magit--with-refresh-cache (cons (magit-top-level git-info-for-hooks) 'config)
      (let ((configs (make-hash-table :test #'equal)))
-       (dolist (conf (magit-git-items "config" "--list" "-z"))
+       ;; WIP: list-z
+       (dolist (conf (magit-list-z git-info-for-hooks))
          (let* ((nl-pos (cl-position ?\n conf))
                 (key (substring conf 0 nl-pos))
                 (val (if nl-pos (substring conf (1+ nl-pos)) "")))

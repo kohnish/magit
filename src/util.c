@@ -9,7 +9,9 @@ void str_cleanup(kstring_t **p) {
 
 kstring_t *str_create(const char *data, int len) {
     kstring_t *s = calloc(1, sizeof(*s));
-    kputsn(data, len, s);
+    if (data) {
+        kputsn(data, len, s);
+    }
     return s;
 }
 
