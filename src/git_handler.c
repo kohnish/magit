@@ -264,7 +264,7 @@ static void git_root_worker(uv_work_t *req) {
     int upstream_subj_ret = git_head_subject(g_repo, data->upstream_subj, target->s);
 
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0) {
-        data->root = str_create(root, strlen(root));
+        data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
         kputs(data->rev_head->s, data->head_log_line);
         kputs(" ", data->head_log_line);

@@ -1351,7 +1351,7 @@ is saved without asking, the user is asked about each modified
 buffer which visits a file in the current repository.  Optional
 argument (the prefix) non-nil means save all with no questions."
   (interactive "P")
-  (when-let ((topdir (magit-top-level git-info-for-hooks)))
+  (when-let* ((topdir (magit-top-level git-info-for-hooks)))
     (let ((remote (file-remote-p default-directory))
           (save-some-buffers-action-alist
            `((?Y (lambda (buffer)
@@ -1391,11 +1391,14 @@ argument (the prefix) non-nil means save all with no questions."
                 ;; repositories, due to the required network access.
                 ;;
                 ;; Check whether the file is inside the repository.
-                (equal (or (cdr (assoc default-directory topdirs))
-                           (let ((top (magit-top-level git-info-for-hooks)))
-                             (push (cons default-directory top) topdirs)
-                             top))
-                       topdir)
+                ;; WIP: probably wrong
+                (if git-info-for-hooks
+                    (file-in-directory-p default-directory topdir)
+                  (equal (or (cdr (assoc default-directory topdirs))
+                             (let ((top (magit-rev-parse-safe "--show-toplevel")))
+                               (push (cons default-directory top) topdirs)
+                               top))
+                         topdir))
                 ;; Check whether the file is actually writable.
                 (file-writable-p buffer-file-name)
                 (prog1 t
