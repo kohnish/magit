@@ -2,7 +2,7 @@
 #include "msgpack_handler.h"
 #include "util.h"
 #include <git2.h>
-
+#
 typedef struct {
     uv_work_t req;
     uint64_t id;
@@ -16,6 +16,8 @@ typedef struct {
     kstring_t *subj;
     kstring_t *upstream_subj;
     kstring_t *tag_desc;
+    kstring_t *opt_tag_desc_head;
+    kstring_t *version;
     int result;
 } git_root_req_T;
 
@@ -47,15 +49,78 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->upstream_subj->s);
             free((*req)->upstream_subj);
         }
+        if ((*req)->version) {
+            free((*req)->version->s);
+            free((*req)->version);
+        }
         if ((*req)->subj) {
             free((*req)->subj->s);
             free((*req)->subj);
+        }
+        if ((*req)->opt_tag_desc_head) {
+            free((*req)->opt_tag_desc_head->s);
+            free((*req)->opt_tag_desc_head);
         }
         free(*req);
     }
 };
 
 #define GIT_ROOT_REQUEST_CLEANUP __attribute__((cleanup(git_root_request_cleanup)))
+
+typedef struct {
+    git_repository *repo;
+    const git_oid *target;
+    char *match;
+} find_tag_ctx;
+
+static int tag_cb(const char *name, git_oid *oid, void *payload)
+{
+    find_tag_ctx *ctx = payload;
+    git_object *obj = NULL, *commit = NULL;
+
+    if (git_object_lookup(&obj, ctx->repo, oid, GIT_OBJECT_ANY) < 0)
+        return 0;
+
+    if (git_object_peel(&commit, obj, GIT_OBJECT_COMMIT) == 0 &&
+        git_oid_equal(git_object_id(commit), ctx->target)) {
+        const char *n = name;
+        if (strncmp(n, "refs/tags/", 10) == 0)
+            n += 10;
+        ctx->match = strdup(n);
+        git_object_free(commit);
+        git_object_free(obj);
+        return 1; /* nonzero stops git_tag_foreach */
+    }
+
+    if (commit) git_object_free(commit);
+    git_object_free(obj);
+    return 0;
+}
+
+static int get_tag_desc_if_match(git_repository *repo, kstring_t *out)
+{
+    git_object *head = NULL;
+    find_tag_ctx ctx = { .repo = repo };
+    int ret;
+
+    ret = git_revparse_single(&head, repo, "HEAD");
+    if (ret < 0)
+        return ret;
+
+    ctx.target = git_object_id(head);
+
+    ret = git_tag_foreach(repo, tag_cb, &ctx);
+    git_object_free(head);
+    if (ret < 0 && ret != GIT_ENOTFOUND)
+        return ret;
+
+    if (ctx.match) {
+        kputs(ctx.match, out);
+        free(ctx.match);
+    }
+
+    return 0;
+}
 
 static int get_tag_desc(git_repository *repo, kstring_t *out) {
     git_object *head = NULL;
@@ -178,6 +243,16 @@ static int git_symbolic_ref_short_head(git_repository *repo, kstring_t *out) {
     return 0;
 }
 
+static kstring_t *git_version_create(void) {
+    int major, minor, rev;
+    kstring_t *out = str_create(NULL, 0);
+    char version[64];
+    git_libgit2_version(&major, &minor, &rev);
+    snprintf(version, sizeof(version), "git version %d.%d.%d", major, minor, rev);
+    kputs(version, out);
+    return out;
+}
+
 static int git_config_list_z(git_repository *repo, kstring_t *out) {
     git_config *cfg = NULL;
     git_config_iterator *iter = NULL;
@@ -263,12 +338,17 @@ static void git_root_worker(uv_work_t *req) {
     kputs(data->upstream_branch->s, target);
     int upstream_subj_ret = git_head_subject(g_repo, data->upstream_subj, target->s);
 
-    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0) {
+    data->opt_tag_desc_head = str_create(NULL, 0);
+    int opt_tag_desc_head_ret = get_tag_desc_if_match(g_repo, data->opt_tag_desc_head);
+
+    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
         kputs(data->rev_head->s, data->head_log_line);
         kputs(" ", data->head_log_line);
         kputs(data->subj->s, data->head_log_line);
+        data->version = git_version_create();
+
         data->result = 0;
     }
 }
@@ -287,7 +367,9 @@ static void after_git_root(uv_work_t *req, int status) {
         .upstream_branch = data->upstream_branch,
         .head_log_line = data->head_log_line,
         .upstream_subj = data->upstream_subj,
-        .tag_desc = data->tag_desc
+        .tag_desc = data->tag_desc,
+        .opt_tag_desc_head = data->opt_tag_desc_head,
+        .version = data->version
     };
     msgpack_handler_send(&res);
 }

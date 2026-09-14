@@ -1940,7 +1940,10 @@ If no such tag can be found or if the distance is 0 (in which
 case it is the current tag, not the next), return nil instead.
 If optional WITH-DISTANCE is non-nil, then return (TAG COMMITS)
 where COMMITS is the number of commits in TAG but not in REV."
-  (and-let* ((str (magit-git-str "describe" "--contains" (or rev "HEAD"))))
+  ;; WIP: tag or 0
+  (and-let* ((str (if (and git-info-for-hooks (not rev))
+                      (magit-info-get magit-info-opt-tag-desc-head-enum git-info-for-hooks)
+                      (magit-git-str "describe" "--contains" (or rev "HEAD")))))
     (save-match-data
       (when (string-match "^[^^~]+" str)
         (setq str (match-string 0 str))
@@ -2138,9 +2141,8 @@ would claim a worktree is bare, even though the working tree is
 specified using `core.worktree'."
   (let ((remote (file-remote-p default-directory))
         worktrees worktree)
-    (dolist (line (if (magit-git-version>= "2.36")
-                      (magit-git-items "worktree" "list" "--porcelain" "-z")
-                    (magit-git-lines "worktree" "list" "--porcelain")))
+    ;; WIP: deprecate magit-version
+    (dolist (line (magit-git-items "worktree" "list" "--porcelain" "-z"))
       (cond ((string-prefix-p "worktree" line)
              (let ((path (substring line 9)))
                (when remote
