@@ -2128,6 +2128,11 @@ PATH has to be relative to the super-repository."
        10 -5)
     (magit-git-string "submodule--helper" "name" path)))
 
+(defun magit-worktree-porcelain (git-info)
+  (if git-info
+      (split-string (magit-info-get magit-info-worktree-porcelain-enum git-info) "\0" t)
+    (magit-git-items "worktree" "list" "--porcelain" "-z")))
+
 (defun magit-list-worktrees ()
   "Return list of the worktrees of this repository.
 
@@ -2142,7 +2147,8 @@ specified using `core.worktree'."
   (let ((remote (file-remote-p default-directory))
         worktrees worktree)
     ;; WIP: deprecate magit-version
-    (dolist (line (magit-git-items "worktree" "list" "--porcelain" "-z"))
+    ;; WIP: worktree first extra slash?
+    (dolist (line (magit-worktree-porcelain git-info-for-hooks))
       (cond ((string-prefix-p "worktree" line)
              (let ((path (substring line 9)))
                (when remote

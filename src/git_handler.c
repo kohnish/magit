@@ -18,6 +18,7 @@ typedef struct {
     kstring_t *tag_desc;
     kstring_t *opt_tag_desc_head;
     kstring_t *version;
+    kstring_t *worktree_porcelain;
     int result;
 } git_root_req_T;
 
@@ -61,6 +62,10 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->opt_tag_desc_head->s);
             free((*req)->opt_tag_desc_head);
         }
+        if ((*req)->worktree_porcelain) {
+            free((*req)->worktree_porcelain->s);
+            free((*req)->worktree_porcelain);
+        }
         free(*req);
     }
 };
@@ -72,6 +77,109 @@ typedef struct {
     const git_oid *target;
     char *match;
 } find_tag_ctx;
+
+static int list_worktrees_porcelain(git_repository *repo, kstring_t *out) {
+    git_reference *head_ref = NULL;
+    git_strarray wt_names = {0};
+    int is_bare = git_repository_is_bare(repo);
+    int ret;
+    /* ---- main worktree ---- */
+    {
+        const char *main_path = is_bare ? git_repository_path(repo) : git_repository_workdir(repo);
+
+        kputs("worktree ", out);
+        kputs(main_path, out);
+        kputc(0, out);
+
+        if (git_repository_head(&head_ref, repo) == 0) {
+            char oidstr[GIT_OID_HEXSZ + 1];
+            git_oid_tostr(oidstr, sizeof(oidstr), git_reference_target(head_ref));
+
+            kputs("HEAD ", out);
+            kputs(oidstr, out);
+            kputc(0, out);
+
+            if (git_repository_head_detached(repo) == 1) {
+                kputs("detached", out);
+                kputc(0, out);
+            } else {
+                kputs("branch ", out);
+                kputs(git_reference_name(head_ref), out);
+                kputc(0, out);
+            }
+            git_reference_free(head_ref);
+        }
+        /* unborn HEAD case skipped here; real git prints an all-zero oid line */
+
+        if (is_bare) {
+            kputs("bare", out);
+            kputc(0, out);
+        }
+
+        kputc(0, out); /* entry terminator */
+    }
+
+    /* ---- linked worktrees ---- */
+    ret = git_worktree_list(&wt_names, repo);
+    if (ret < 0)
+        return ret;
+
+    for (size_t i = 0; i < wt_names.count; i++) {
+        git_worktree *wt = NULL;
+        git_repository *wt_repo = NULL;
+        git_buf lock_reason = GIT_BUF_INIT;
+
+        if (git_worktree_lookup(&wt, repo, wt_names.strings[i]) < 0)
+            continue;
+
+        kputs("worktree ", out);
+        kputs(git_worktree_path(wt), out);
+        kputc(0, out);
+
+        if (git_repository_open_from_worktree(&wt_repo, wt) == 0) {
+            if (git_repository_head(&head_ref, wt_repo) == 0) {
+                char oidstr[GIT_OID_HEXSZ + 1];
+                git_oid_tostr(oidstr, sizeof(oidstr), git_reference_target(head_ref));
+
+                kputs("HEAD ", out);
+                kputs(oidstr, out);
+                kputc(0, out);
+
+                if (git_repository_head_detached(wt_repo) == 1) {
+                    kputs("detached", out);
+                    kputc(0, out);
+                } else {
+                    kputs("branch ", out);
+                    kputs(git_reference_name(head_ref), out);
+                    kputc(0, out);
+                }
+                git_reference_free(head_ref);
+            }
+            git_repository_free(wt_repo);
+        }
+
+        if (git_worktree_is_locked(&lock_reason, wt) > 0) {
+            kputs("locked", out);
+            if (lock_reason.ptr && *lock_reason.ptr) {
+                kputc(' ', out);
+                kputs(lock_reason.ptr, out);
+            }
+            kputc(0, out);
+        }
+        git_buf_dispose(&lock_reason);
+
+        if (git_worktree_is_prunable(wt, NULL) > 0) {
+            kputs("prunable", out);
+            kputc(0, out);
+        }
+
+        kputc(0, out); /* entry terminator */
+        git_worktree_free(wt);
+    }
+
+    git_strarray_free(&wt_names);
+    return 0;
+}
 
 static int tag_cb(const char *name, git_oid *oid, void *payload)
 {
@@ -341,7 +449,10 @@ static void git_root_worker(uv_work_t *req) {
     data->opt_tag_desc_head = str_create(NULL, 0);
     int opt_tag_desc_head_ret = get_tag_desc_if_match(g_repo, data->opt_tag_desc_head);
 
-    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0) {
+    data->worktree_porcelain = str_create(NULL, 0);
+    int worktree_porcelain_ret = list_worktrees_porcelain(g_repo, data->worktree_porcelain);
+
+    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
         kputs(data->rev_head->s, data->head_log_line);
@@ -369,7 +480,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .upstream_subj = data->upstream_subj,
         .tag_desc = data->tag_desc,
         .opt_tag_desc_head = data->opt_tag_desc_head,
-        .version = data->version
+        .version = data->version,
+        .worktree_porcelain = data->worktree_porcelain
     };
     msgpack_handler_send(&res);
 }
