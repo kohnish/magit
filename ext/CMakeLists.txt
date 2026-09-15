@@ -7,6 +7,7 @@ add_subdirectory(msgpack_c)
 add_subdirectory(libuv)
 add_subdirectory(libgit2)
 add_subdirectory(utf8proc)
+add_subdirectory(openssl)
 
 if(ENABLE_TESTS)
     add_subdirectory(unity)

@@ -22,7 +22,6 @@ set(lib
     libuv
     libgit2
     libmsgpack-c
-    # ToDo: git2 deps, import to the project
     ssl
     crypto
     z

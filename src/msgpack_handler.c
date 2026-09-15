@@ -159,9 +159,9 @@ int msgpack_handler_recv(uv_loop_t *loop, const char *data, size_t len) {
         };
     }
 
-    FILE *fp = fopen("/var/tmp/log", "a");
-    fprintf(fp, "WIP: received %lu\n", id);
-    fclose(fp);
+    // FILE *fp = fopen("/var/tmp/log", "a");
+    // fprintf(fp, "WIP: received %lu\n", id);
+    // fclose(fp);
 
     if (id != 0 && cmd != 0) {
         switch ((enum CMD)cmd) {
