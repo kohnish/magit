@@ -812,6 +812,11 @@ Also see `magit-git-config-p'."
         (expand-file-name (convert-standard-filename path) dir)
       dir)))
 
+(defun magit-dot-git-dir (git-info)
+  (if git-info
+      (magit-info-get magit-info-dot-git-dir-enum git-info)
+    (magit-rev-parse-safe "--git-dir")))
+
 (defun magit-gitdir (&optional directory)
   "Return the absolute and resolved path of the .git directory.
 
@@ -823,7 +828,7 @@ not located inside a Git repository, then return nil."
     (magit--with-refresh-cache (list default-directory 'magit-gitdir)
       (magit--with-safe-default-directory nil
         (and-let*
-            ((dir (magit-rev-parse-safe "--git-dir"))
+            ((dir (magit-dot-git-dir git-info-for-hooks))
              (dir (file-name-as-directory (magit-expand-git-file-name dir))))
           (if (file-remote-p dir)
               dir
@@ -2159,6 +2164,7 @@ specified using `core.worktree'."
                ;; what it is supposed to do and not what we want.
                ;; However, if the worktree has been removed, then
                ;; we want to return it anyway; instead of nil.
+               ;; WIP: supporting worktree in the same magit-server process might be tricky
                (setq path (or (magit-toplevel path) path))
                (setq worktree (list path nil nil nil nil nil nil))
                (push worktree worktrees)))

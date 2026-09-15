@@ -23,6 +23,7 @@ typedef struct {
 } git_root_req_T;
 
 git_repository *g_repo = NULL;
+kstring_t *g_dot_git_dir = NULL;
 
 static void git_root_request_cleanup(git_root_req_T **req) {
     if (req && *req) {
@@ -205,10 +206,9 @@ static int tag_cb(const char *name, git_oid *oid, void *payload)
     return 0;
 }
 
-static int get_tag_desc_if_match(git_repository *repo, kstring_t *out)
-{
+static int get_tag_desc_if_match(git_repository *repo, kstring_t *out) {
     git_object *head = NULL;
-    find_tag_ctx ctx = { .repo = repo };
+    find_tag_ctx ctx = {.repo = repo};
     int ret;
 
     ret = git_revparse_single(&head, repo, "HEAD");
@@ -481,7 +481,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .tag_desc = data->tag_desc,
         .opt_tag_desc_head = data->opt_tag_desc_head,
         .version = data->version,
-        .worktree_porcelain = data->worktree_porcelain
+        .worktree_porcelain = data->worktree_porcelain,
+        .dot_git_dir = g_dot_git_dir // global
     };
     msgpack_handler_send(&res);
 }
@@ -501,9 +502,21 @@ int git_handler_queue_git_status(uv_loop_t *loop, u_int64_t id, kstring_t *pwd) 
 }
 
 int git_handler_repo_init(const char *path) {
+    git_buf gitdir = GIT_BUF_INIT;
+    kstring_t *out = str_create(NULL, 0);
+    int ret = git_repository_discover(&gitdir, path, 0, NULL);
+    if (ret == 0) {
+        kputs(gitdir.ptr, out);
+        g_dot_git_dir = out;
+        git_buf_dispose(&gitdir);
+    }
     return git_repository_open_ext(&g_repo, path, 0, NULL);
 }
 
 void git_handler_repo_deinit() {
     git_repository_free(g_repo);
+    if (g_dot_git_dir) {
+        free(g_dot_git_dir->s);
+        free(g_dot_git_dir);
+    }
 }
