@@ -6,7 +6,7 @@ if(BUILD_SHARED_LIBS)
     else()
         add_library(${lib_name} SHARED IMPORTED GLOBAL)
         set_target_properties(${lib_name} PROPERTIES IMPORTED_LOCATION ${pkgcfg_lib_LIBGIT2_git2})
-        if("${MSGPACK_INCLUDE_DIRS}" STREQUAL "")
+        if("${LIBGIT2_INCLUDE_DIRS}" STREQUAL "")
             message("No include dir for ${lib_name}")
         else()
             set_target_properties(${lib_name} PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${LIBGIT2_INCLUDE_DIRS})
@@ -22,7 +22,7 @@ else()
         DOWNLOAD_EXTRACT_TIMESTAMP ON
     )
     add_library(${lib_name} STATIC IMPORTED GLOBAL)
-    add_dependencies(${lib_name} ${lib_name}_build)
+    add_dependencies(${lib_name} ${lib_name}_build openssl_build)
     file(MAKE_DIRECTORY ${inst_prefix}/include)
     set_target_properties(${lib_name} PROPERTIES
         IMPORTED_LOCATION ${inst_prefix}/lib/${lib_name}.a

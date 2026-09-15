@@ -4,12 +4,14 @@ if(BUILD_SHARED_LIBS)
     if("${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "MSYS")
         message("Msys has no proper pkgconfig for ${lib_name}")
     else()
-        add_library(${lib_name} SHARED IMPORTED GLOBAL)
-        set_target_properties(${lib_name} PROPERTIES IMPORTED_LOCATION ${pkgcfg_lib_OPENSSL_git2})
-        if("${MSGPACK_INCLUDE_DIRS}" STREQUAL "")
+        add_library(ssl SHARED IMPORTED GLOBAL)
+        add_library(crypto SHARED IMPORTED GLOBAL)
+        set_target_properties(ssl PROPERTIES IMPORTED_LOCATION ${pkgcfg_lib_OPENSSL_ssl})
+        set_target_properties(crypto PROPERTIES IMPORTED_LOCATION ${pkgcfg_lib_OPENSSL_crypto})
+        if("${OPENSSL_INCLUDE_DIRS}" STREQUAL "")
             message("No include dir for ${lib_name}")
         else()
-            set_target_properties(${lib_name} PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${OPENSSL_INCLUDE_DIRS})
+            set_target_properties(ssl PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${OPENSSL_INCLUDE_DIRS})
         endif()
     endif()
 else()
@@ -17,13 +19,15 @@ else()
     ExternalProject_Add(${lib_name}_build
         URL https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz
         BUILD_IN_SOURCE 1
-        CONFIGURE_COMMAND ./config --prefix=${inst_prefix} --openssldir=${inst_prefix} no-shared no-weak-ssl-ciphers
+        CONFIGURE_COMMAND ./config --prefix=${inst_prefix} --libdir=lib --openssldir=${inst_prefix} no-shared no-weak-ssl-ciphers
+        BUILD_COMMAND make -j8
         INSTALL_COMMAND make install_sw
         URL_HASH SHA256=a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2
-        BUILD_BYPRODUCTS ${inst_prefix}/lib/${lib_name}.a
+        BUILD_BYPRODUCTS "${inst_prefix}/lib/libssl.a" "${inst_prefix}/lib/libcrypto.a"
         DOWNLOAD_EXTRACT_TIMESTAMP ON
     )
 
+    make_directory(${inst_prefix}/include)
     add_library(ssl STATIC IMPORTED GLOBAL)
     set_target_properties(ssl PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${inst_prefix}
