@@ -19,6 +19,7 @@ typedef struct {
     kstring_t *opt_tag_desc_head;
     kstring_t *version;
     kstring_t *worktree_porcelain;
+    kstring_t *config_status_show_untracked_files;
     int result;
 } git_root_req_T;
 
@@ -67,6 +68,10 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->worktree_porcelain->s);
             free((*req)->worktree_porcelain);
         }
+        if ((*req)->config_status_show_untracked_files) {
+            free((*req)->config_status_show_untracked_files->s);
+            free((*req)->config_status_show_untracked_files);
+        }
         free(*req);
     }
 };
@@ -78,6 +83,25 @@ typedef struct {
     const git_oid *target;
     char *match;
 } find_tag_ctx;
+
+
+static int get_config_status_show_untracked_files(git_repository *repo, kstring_t *out) {
+    git_config *config = NULL;
+    const char *value = NULL;
+    int error;
+
+    error = git_repository_config(&config, repo);
+    if (error < 0)
+        return error;
+
+    error = git_config_get_string(&value, config, "status.showUntrackedFiles");
+
+    if (error == 0 && value != NULL) {
+        kputs(value, out);
+    }
+    git_config_free(config);
+    return 0;
+}
 
 static int list_worktrees_porcelain(git_repository *repo, kstring_t *out) {
     git_reference *head_ref = NULL;
@@ -452,14 +476,16 @@ static void git_root_worker(uv_work_t *req) {
     data->worktree_porcelain = str_create(NULL, 0);
     int worktree_porcelain_ret = list_worktrees_porcelain(g_repo, data->worktree_porcelain);
 
-    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0) {
+    data->config_status_show_untracked_files = str_create(NULL, 0);
+    int config_status_show_untracked_files_ret = get_config_status_show_untracked_files(g_repo, data->config_status_show_untracked_files);
+
+    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
         kputs(data->rev_head->s, data->head_log_line);
         kputs(" ", data->head_log_line);
         kputs(data->subj->s, data->head_log_line);
         data->version = git_version_create();
-
         data->result = 0;
     }
 }
@@ -482,7 +508,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .opt_tag_desc_head = data->opt_tag_desc_head,
         .version = data->version,
         .worktree_porcelain = data->worktree_porcelain,
-        .dot_git_dir = g_dot_git_dir // global
+        .dot_git_dir = g_dot_git_dir, // global
+        .config_status_show_untracked_files = data->config_status_show_untracked_files
     };
     msgpack_handler_send(&res);
 }

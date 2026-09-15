@@ -505,6 +505,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-version-enum 11)
 (defconst magit-info-worktree-porcelain-enum 12)
 (defconst magit-info-dot-git-dir-enum 13)
+(defconst magit-info-config-status-show-untracked-files-enum 14)
 
 (defun magit-info-get (key info)
   (when info
@@ -841,6 +842,12 @@ remote in alphabetic order."
   "Assume-unchanged files" assume-unchanged nil
   magit-insert-assume-unchanged-files)
 
+;; WIP: git config
+(defun magit-config-status-show-untracked-files (git-info)
+  (if git-info
+      (split-string (magit-info-get magit-info-config-status-show-untracked-files-enum git-info) "\0" t)
+    (magit-get "--local" "status.showUntrackedFiles")))
+
 (defun magit-insert-untracked-files ()
   "Maybe insert list of untracked files.
 
@@ -852,7 +859,7 @@ is always ignored."
   (when-let*
       ((value (or (and (local-variable-p 'magit-status-show-untracked-files)
                        magit-status-show-untracked-files)
-                  (pcase (magit-get "--local" "status.showUntrackedFiles")
+                  (pcase (magit-config-status-show-untracked-files git-info-for-hooks)
                     ((or "no" "off" "false" "0") 'no)
                     ((or "yes" "on" "true" "1") t)
                     ("all" 'all))
