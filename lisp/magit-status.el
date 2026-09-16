@@ -506,6 +506,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-worktree-porcelain-enum 12)
 (defconst magit-info-dot-git-dir-enum 13)
 (defconst magit-info-config-status-show-untracked-files-enum 14)
+(defconst magit-info-status-enum 15)
 
 (defun magit-info-get (key info)
   (when info
@@ -871,10 +872,11 @@ is always ignored."
        (mapcan (lambda (line)
                  (and (eq (aref line 0) ??)
                       (list (substring line 3))))
-               (apply #'magit-git-items "status" "-z" "--porcelain"
-                      (format "--untracked-files=%s"
-                              (if (eq value 'all) "all" "normal"))
-                      "--" files))))))
+               (if git-info-for-hooks
+                   (split-string (magit-info-get magit-info-status-enum git-info-for-hooks) "\0" t)
+                 (apply #'magit-git-items "status" "-z" "--porcelain"
+                        (format "--untracked-files=%s" (if (eq value 'all) "all" "normal"))
+                        "--" files)))))))
 
 (defun magit-insert-tracked-files ()
   "Insert a list of tracked files.

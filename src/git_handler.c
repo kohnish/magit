@@ -20,6 +20,7 @@ typedef struct {
     kstring_t *version;
     kstring_t *worktree_porcelain;
     kstring_t *config_status_show_untracked_files;
+    kstring_t *status;
     int result;
 } git_root_req_T;
 
@@ -72,6 +73,10 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->config_status_show_untracked_files->s);
             free((*req)->config_status_show_untracked_files);
         }
+        if ((*req)->status) {
+            free((*req)->status->s);
+            free((*req)->status);
+        }
         free(*req);
     }
 };
@@ -83,6 +88,95 @@ typedef struct {
     const git_oid *target;
     char *match;
 } find_tag_ctx;
+
+static int get_status_porcelain_z(git_repository *repo, kstring_t *out) {
+    git_status_list *status = NULL;
+    git_status_options opts = GIT_STATUS_OPTIONS_INIT;
+    size_t i, n;
+    int ret;
+
+    opts.version = GIT_STATUS_OPTIONS_VERSION;
+    opts.show = GIT_STATUS_SHOW_INDEX_AND_WORKDIR;
+    opts.flags = GIT_STATUS_OPT_INCLUDE_UNTRACKED |
+                 GIT_STATUS_OPT_RENAMES_HEAD_TO_INDEX |
+                 GIT_STATUS_OPT_RENAMES_INDEX_TO_WORKDIR |
+                 GIT_STATUS_OPT_SORT_CASE_SENSITIVELY;
+    /* untracked-files=normal: do NOT set
+     * GIT_STATUS_OPT_RECURSE_UNTRACKED_DIRS -- that corresponds to
+     * --untracked-files=all and lists every file inside new dirs
+     * instead of collapsing them to "dirname/". */
+
+    ret = git_status_list_new(&status, repo, &opts);
+    if (ret < 0)
+        return ret;
+
+    n = git_status_list_entrycount(status);
+    for (i = 0; i < n; i++) {
+        const git_status_entry *e = git_status_byindex(status, i);
+        unsigned int s = e->status;
+        char X = ' ', Y = ' ';
+        const char *path = NULL;
+        const char *old_path = NULL;
+
+        if (s == GIT_STATUS_CURRENT)
+            continue;
+
+        if (s & GIT_STATUS_INDEX_NEW)          X = 'A';
+        else if (s & GIT_STATUS_INDEX_MODIFIED)  X = 'M';
+        else if (s & GIT_STATUS_INDEX_DELETED)   X = 'D';
+        else if (s & GIT_STATUS_INDEX_RENAMED)   X = 'R';
+        else if (s & GIT_STATUS_INDEX_TYPECHANGE) X = 'T';
+
+        if (s & GIT_STATUS_WT_NEW)          Y = '?';
+        else if (s & GIT_STATUS_WT_MODIFIED)  Y = 'M';
+        else if (s & GIT_STATUS_WT_DELETED)   Y = 'D';
+        else if (s & GIT_STATUS_WT_RENAMED)   Y = 'R';
+        else if (s & GIT_STATUS_WT_TYPECHANGE) Y = 'T';
+
+        /* untracked: index side stays '?' too, matching porcelain "??" */
+        if ((s & GIT_STATUS_WT_NEW) &&
+            !(s & (GIT_STATUS_INDEX_NEW | GIT_STATUS_INDEX_MODIFIED |
+                   GIT_STATUS_INDEX_DELETED | GIT_STATUS_INDEX_RENAMED |
+                   GIT_STATUS_INDEX_TYPECHANGE)))
+            X = '?';
+
+        if (s & GIT_STATUS_CONFLICTED)
+            X = Y = 'U';
+
+        /* pick path, preferring workdir diff (has the newest name) */
+        if (e->index_to_workdir && e->index_to_workdir->new_file.path) {
+            path = e->index_to_workdir->new_file.path;
+            if (e->index_to_workdir->old_file.path &&
+                strcmp(e->index_to_workdir->old_file.path, path) != 0)
+                old_path = e->index_to_workdir->old_file.path;
+        } else if (e->head_to_index && e->head_to_index->new_file.path) {
+            path = e->head_to_index->new_file.path;
+        }
+
+        if (!old_path && e->head_to_index && e->head_to_index->old_file.path &&
+            e->head_to_index->new_file.path &&
+            strcmp(e->head_to_index->old_file.path,
+                   e->head_to_index->new_file.path) != 0)
+            old_path = e->head_to_index->old_file.path;
+
+        if (!path)
+            continue;
+
+        kputc(X, out);
+        kputc(Y, out);
+        kputc(' ', out);
+        kputs(path, out);
+        kputc('\0', out);
+
+        if (old_path) {
+            kputs(old_path, out);
+            kputc('\0', out);
+        }
+    }
+
+    git_status_list_free(status);
+    return 0;
+}
 
 
 static int get_config_status_show_untracked_files(git_repository *repo, kstring_t *out) {
@@ -479,7 +573,10 @@ static void git_root_worker(uv_work_t *req) {
     data->config_status_show_untracked_files = str_create(NULL, 0);
     int config_status_show_untracked_files_ret = get_config_status_show_untracked_files(g_repo, data->config_status_show_untracked_files);
 
-    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0) {
+    data->status = str_create(NULL, 0);
+    int status_ret = get_status_porcelain_z(g_repo, data->status);
+
+    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
         kputs(data->rev_head->s, data->head_log_line);
@@ -509,7 +606,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .version = data->version,
         .worktree_porcelain = data->worktree_porcelain,
         .dot_git_dir = g_dot_git_dir, // global
-        .config_status_show_untracked_files = data->config_status_show_untracked_files
+        .config_status_show_untracked_files = data->config_status_show_untracked_files,
+        .status = data->status
     };
     msgpack_handler_send(&res);
 }
