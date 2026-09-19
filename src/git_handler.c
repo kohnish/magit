@@ -30,6 +30,7 @@ typedef struct {
     kstring_t *stash;
     kstring_t *branches;
     kstring_t *revision_by_idx;
+    kstring_t *logs;
     int result;
 } git_root_req_T;
 
@@ -123,7 +124,213 @@ typedef struct {
 #include <git2/sys/errors.h>   /* git_error_clear() */
 
 #define NUL(out) kputc('\0', (out))
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <git2.h>
+#include <git2/sys/errors.h>
+#include "kstring.h"
+#include "kvec.h"
 
+#define FF '\x0c'
+#define CLEANUP(fn) __attribute__((cleanup(fn)))
+
+#define DEFINE_CLEANUP(type, free_fn)                        \
+    static inline void cleanup_##type(type **p) {            \
+        if (*p)                                              \
+            free_fn(*p);                                     \
+    }
+
+DEFINE_CLEANUP(git_revwalk,            git_revwalk_free)
+DEFINE_CLEANUP(git_mailmap,            git_mailmap_free)
+DEFINE_CLEANUP(git_reference,          git_reference_free)
+DEFINE_CLEANUP(git_reference_iterator, git_reference_iterator_free)
+DEFINE_CLEANUP(git_object,             git_object_free)
+DEFINE_CLEANUP(git_signature,          git_signature_free)
+
+static inline void cleanup_git_buf(git_buf *b) { git_buf_dispose(b); }
+
+/* ---- commit list: malloc'd arrays plus per-commit decoration names ---- */
+
+typedef kvec_t(char *) namevec_t;
+
+typedef struct {
+    git_commit **commits;   /* calloc'd, `count` slots filled */
+    namevec_t   *decor;     /* calloc'd, one vector per slot  */
+    size_t       count;
+    size_t       cap;
+} commit_list_t;
+
+static int commit_list_init(commit_list_t *l, size_t cap) {
+    l->count = 0;
+    l->cap = cap;
+    l->commits = calloc(cap, sizeof(*l->commits));
+    l->decor = calloc(cap, sizeof(*l->decor));
+    return (l->commits && l->decor) ? 0 : -1;
+}
+
+static void commit_list_free(commit_list_t *l) {
+    for (size_t i = 0; i < l->count; i++) {
+        for (size_t j = 0; j < kv_size(l->decor[i]); j++)
+            free(kv_A(l->decor[i], j));
+        kv_destroy(l->decor[i]);
+        git_commit_free(l->commits[i]);
+    }
+    free(l->decor);
+    free(l->commits);
+}
+
+static void put_i64(kstring_t *out, long long n) {
+    char tmp[32];
+    int len = snprintf(tmp, sizeof(tmp), "%lld", n);
+    if (len > 0)
+        kputsn(tmp, (size_t)len, out);
+}
+
+/* git log --format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%s --decorate=full
+ *         -n<limit> --use-mailmap --no-prefix --                      */
+static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
+    CLEANUP(commit_list_free)             commit_list_t list = {0};
+    CLEANUP(cleanup_git_revwalk)          git_revwalk *walk = NULL;
+    CLEANUP(cleanup_git_mailmap)          git_mailmap *mailmap = NULL;
+    CLEANUP(cleanup_git_reference)        git_reference *head = NULL;
+    CLEANUP(cleanup_git_reference_iterator) git_reference_iterator *iter = NULL;
+    const char *head_name;
+    const git_oid *head_oid;
+    int head_attached;
+    git_oid oid;
+    int ret;
+
+    if (limit == 0)
+        return 0;
+    if (commit_list_init(&list, limit) < 0)
+        return -1;
+
+    /* 1. Walk HEAD, newest first, at most `limit` commits. */
+    ret = git_revwalk_new(&walk, repo);
+    if (ret < 0)
+        return ret;
+    git_revwalk_sorting(walk, GIT_SORT_TIME);
+    ret = git_revwalk_push_head(walk);          /* fails on unborn HEAD */
+    if (ret < 0)
+        return ret;
+
+    while (list.count < limit && (ret = git_revwalk_next(&oid, walk)) == 0) {
+        ret = git_commit_lookup(&list.commits[list.count], repo, &oid);
+        if (ret < 0)
+            return ret;
+        list.count++;
+    }
+    if (ret < 0 && ret != GIT_ITEROVER)
+        return ret;
+
+    ret = git_mailmap_from_repository(&mailmap, repo);
+    if (ret < 0)
+        return ret;
+
+    /* 2. HEAD: attached to a branch, or detached. */
+    ret = git_repository_head(&head, repo);
+    if (ret < 0)
+        return ret;
+    head_name = git_reference_name(head);       /* "refs/heads/x" or "HEAD" */
+    head_attached = git_reference_is_branch(head);
+    head_oid = git_reference_target(head);
+
+    /* 3. Decorations: every ref whose peeled commit is in our list. */
+    ret = git_reference_iterator_new(&iter, repo);
+    if (ret < 0)
+        return ret;
+
+    for (;;) {
+        CLEANUP(cleanup_git_reference) git_reference *ref = NULL;
+        CLEANUP(cleanup_git_object)    git_object *obj = NULL;
+        const char *name;
+
+        ret = git_reference_next(&ref, iter);
+        if (ret == GIT_ITEROVER)
+            break;
+        if (ret < 0)
+            return ret;
+
+        name = git_reference_name(ref);
+        if (strncmp(name, "refs/prefetch/", 14) == 0 ||
+            (head_attached && strcmp(name, head_name) == 0))
+            continue;   /* current branch is printed via "HEAD -> ..." */
+
+        /* Peels annotated tags and symbolic refs (origin/HEAD) to a commit. */
+        if (git_reference_peel(&obj, ref, GIT_OBJECT_COMMIT) < 0) {
+            git_error_clear();
+            continue;
+        }
+
+        for (size_t i = 0; i < list.count; i++) {
+            if (!git_oid_equal(git_object_id(obj), git_commit_id(list.commits[i])))
+                continue;
+
+            int is_tag = strncmp(name, "refs/tags/", 10) == 0;
+            size_t len = strlen(name) + 6;      /* "tag: " + name + NUL */
+            char *s = malloc(len);
+            if (!s)
+                return -1;
+            snprintf(s, len, "%s%s", is_tag ? "tag: " : "", name);
+            kv_push(char *, list.decor[i], s);
+            break;
+        }
+    }
+
+    /* 4. Emit one line per commit. */
+    for (size_t i = 0; i < list.count; i++) {
+        CLEANUP(cleanup_git_buf)       git_buf sid = GIT_BUF_INIT;
+        CLEANUP(cleanup_git_signature) git_signature *sig = NULL;
+        git_commit *c = list.commits[i];
+        const char *summary;
+        int first = 1;
+
+        /* %h */
+        ret = git_object_short_id(&sid, (git_object *)c);
+        if (ret < 0)
+            return ret;
+        kputs(sid.ptr, out);
+        kputc(FF, out);
+
+        /* %D: HEAD entry first, then the rest in reverse ref order. */
+        if (git_oid_equal(head_oid, git_commit_id(c))) {
+            if (head_attached) {
+                kputs("HEAD -> ", out);
+                kputs(head_name, out);
+            } else {
+                kputs("HEAD", out);
+            }
+            first = 0;
+        }
+        for (size_t j = kv_size(list.decor[i]); j > 0; j--) {
+            if (!first)
+                kputs(", ", out);
+            kputs(kv_A(list.decor[i], j - 1), out);
+            first = 0;
+        }
+        kputc(FF, out);
+        kputc(FF, out);                         /* the empty field */
+
+        /* %aN, %at */
+        ret = git_commit_author_with_mailmap(&sig, c, mailmap);
+        if (ret < 0)
+            return ret;
+        kputs(sig->name, out);
+        kputc(FF, out);
+        put_i64(out, (long long)sig->when.time);
+        kputc(FF, out);
+
+        /* %s */
+        summary = git_commit_summary(c);
+        kputs(summary ? summary : "", out);
+        kputc('\n', out);
+    }
+
+    return 0;
+}
+
+/* usage: get_log(repo, 30, out); */
 static const char *shorten_upstream(const char *name) {
     if (strncmp(name, "refs/remotes/", sizeof("refs/remotes/") - 1) == 0)
         return name + sizeof("refs/remotes/") - 1;
@@ -888,6 +1095,9 @@ static void git_root_worker(uv_work_t *req) {
     data->revision_by_idx = str_create(NULL, 0);
     get_rev_parse_verify(g_repo, "HEAD~30", data->revision_by_idx);
 
+    data->logs = str_create(NULL, 0);
+    get_log(g_repo, 30, data->logs);
+
 
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
@@ -927,6 +1137,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .stash = data->stash,
         .branches = data->branches,
         .revision_by_idx = data->revision_by_idx,
+        .logs = data->logs,
     };
     msgpack_handler_send(&res);
 }

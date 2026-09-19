@@ -1230,6 +1230,27 @@ Do not add this to a hook variable."
         args)
       "--use-mailmap" "--no-prefix" revs "--" files)))
 
+(defun magit--git-wash-logs (insert-string)
+  (declare (indent 2))
+  (let ((beg (point)))
+    (insert insert-string)
+    (unless (bolp)
+      (insert "\n"))
+    (save-restriction
+      (narrow-to-region beg (point))
+      (goto-char beg)
+      (goto-char (line-beginning-position))
+      (magit-wash-sequence (apply-partially #'magit-log-wash-log 'log '("--format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%s"
+                                                                   "--decorate=full"
+                                                                   "-n30"
+                                                                   "--use-mailmap"
+                                                                   "--no-prefix"
+                                                                   "--")))
+      (insert ?\n))))
+
+(defun magit--insert-log-for-status (git-info)
+  (magit--git-wash-logs (magit-info-get magit-info-logs-enum git-info)))
+
 (cl-defmethod magit-menu-common-value ((_section magit-commit-section))
   (or (magit-diff--region-range)
       (oref (magit-current-section) value)))
@@ -1965,11 +1986,13 @@ Show the last `magit-log-section-commit-count' commits."
                            (or value range)
                            t)
       (magit-insert-heading "Recent commits")
-      (magit--insert-log nil
-        (and (member "--graph" magit-buffer-log-args) range)
-        (cons (format "-n%d" magit-log-section-commit-count)
-              (--remove (string-prefix-p "-n" it)
-                        magit-buffer-log-args))))))
+      (if git-info-for-hooks
+          (magit--insert-log-for-status git-info-for-hooks)
+        (magit--insert-log nil
+          (and (member "--graph" magit-buffer-log-args) range)
+          (cons (format "-n%d" magit-log-section-commit-count)
+                (--remove (string-prefix-p "-n" it)
+                          magit-buffer-log-args)))))))
 
 (magit-define-section-jumper magit-jump-to-unpushed-to-pushremote
   "Unpushed to <push-remote>" unpushed "@{push}.."
