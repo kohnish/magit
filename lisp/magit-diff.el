@@ -3083,13 +3083,77 @@ It the SECTION has a different type, then do nothing."
 (magit-define-section-jumper magit-jump-to-unstaged
   "Unstaged changes" unstaged nil magit-insert-unstaged-changes)
 
+(defun magit--git-insert-new (return-error &rest args)
+  (setq args (flatten-tree args))
+  (if (or return-error magit-git-debug)
+      (let (log)
+        (unwind-protect
+            (let (exit errmsg)
+              (setq log (make-temp-file "magit-stderr"))
+              (delete-file log)
+              (setq exit 0)
+              (insert (magit-info-get magit-info-diff-enum git-info-for-hooks))
+              (or errmsg exit))
+          (ignore-errors (delete-file log))))
+    (magit-process-git (list t nil) args)))
+
+(defun magit--git-wash-new (washer keep-error &rest args)
+  (declare (indent 2))
+  (setq args (flatten-tree args))
+  (let ((beg (point))
+        (exit (magit--git-insert-new (and keep-error 'full) args)))
+    (when (stringp exit)
+      (goto-char beg)
+      (insert (propertize exit 'face 'error))
+      (insert (if (bolp) "\n" "\n\n")))
+    (if (= (point) beg)
+        (magit-cancel-section)
+      (unless (bolp)
+        (insert "\n"))
+      (when (or (equal exit 0)
+                (eq keep-error 'wash-anyway))
+        (save-restriction
+          (narrow-to-region beg (point))
+          (goto-char beg)
+          (funcall washer args))
+        (when (or (= (point) beg)
+                  (= (point) (1+ beg)))
+          (magit-cancel-section))
+        (magit-maybe-make-margin-overlay)))
+    exit))
+
+(defun magit--insert-diff-new (keep-error &rest args)
+  (declare (indent 1))
+  (pcase-let ((`(,cmd . ,args)
+               (flatten-tree args))
+              (magit-git-global-arguments
+               (remove "--literal-pathspecs" magit-git-global-arguments)))
+    ;; We need to generate diffs with --ita-visible-in-index so that
+    ;; `magit-stage' can work with intent-to-add files (see #4026).
+    (unless (equal cmd "merge-tree")
+      (push "--ita-visible-in-index" args))
+    (setq args (magit-diff--maybe-add-stat-arguments args))
+    (when (cl-member-if (lambda (arg) (string-prefix-p "--color-moved" arg)) args)
+      (push "--color=always" args)
+      (setq magit-git-global-arguments
+            (append magit-diff--reset-non-color-moved
+                    magit-git-global-arguments)))
+    (magit--git-wash-new #'magit-diff-wash-diffs
+        (if (member "--no-index" args)
+            'wash-anyway
+          (or keep-error magit--git-wash-keep-error))
+      cmd args)))
+
 (defun magit-insert-unstaged-changes ()
   "Insert section showing unstaged changes."
   (magit-insert-section (unstaged)
     (magit-insert-heading t "Unstaged changes")
-    (magit--insert-diff nil
-      "diff" magit-buffer-diff-args "--no-prefix"
-      "--" magit-buffer-diff-files)))
+    (if git-info-for-hooks
+        (magit--insert-diff-new nil "diff" magit-buffer-diff-args "--no-prefix"
+                                "--" magit-buffer-diff-files)
+      (magit--insert-diff nil
+        "diff" magit-buffer-diff-args "--no-prefix"
+        "--" magit-buffer-diff-files))))
 
 (defvar-keymap magit-staged-section-map
   :doc "Keymap for the `staged' section."
