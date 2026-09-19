@@ -3136,11 +3136,16 @@ It the SECTION has a different type, then do nothing."
       (magit-wash-sequence (apply-partially #'magit-diff-wash-diff '("diff" "--cached" "--no-ext-diff" "--no-prefix" "--")))
       (insert ?\n))))
 
+(defun magit-bare-repo-p-new (git-info)
+  (if git-info
+      (eq (magit-info-get magit-info-is-bare-enum git-info-for-hooks) 1)
+    (magit-bare-repo-p)))
+
 ;;
 (defun magit-insert-staged-changes ()
   "Insert section showing staged changes."
   ;; Avoid listing all files as deleted when visiting a bare repo.
-  (unless (magit-bare-repo-p)
+  (unless (magit-bare-repo-p-new git-info-for-hooks)
     (magit-insert-section (staged)
       (magit-insert-heading t "Staged changes")
       (if-let* ((diff-str (magit-info-get magit-info-staged-enum git-info-for-hooks)))

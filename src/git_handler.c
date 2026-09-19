@@ -3,6 +3,8 @@
 #include "util.h"
 #include <git2.h>
 #include <git2/sys/errors.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 typedef struct {
     uv_work_t req;
@@ -24,6 +26,7 @@ typedef struct {
     kstring_t *status;
     kstring_t *diff;
     kstring_t *staged;
+    uint64_t is_bare;
     int result;
 } git_root_req_T;
 
@@ -694,6 +697,8 @@ static void git_root_worker(uv_work_t *req) {
     data->staged = str_create(NULL, 0);
     int staged_ret = get_staged(g_repo, data->staged);
 
+    data->is_bare = git_repository_is_bare(g_repo) ? 1 : 0;
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
@@ -727,7 +732,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .config_status_show_untracked_files = data->config_status_show_untracked_files,
         .status = data->status,
         .diff = data->diff,
-        .staged = data->staged
+        .staged = data->staged,
+        .is_bare = data->is_bare
     };
     msgpack_handler_send(&res);
 }
