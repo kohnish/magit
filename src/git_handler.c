@@ -27,6 +27,7 @@ typedef struct {
     kstring_t *diff;
     kstring_t *staged;
     uint64_t is_bare;
+    kstring_t *stash;
     int result;
 } git_root_req_T;
 
@@ -91,6 +92,10 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->staged->s);
             free((*req)->staged);
         }
+        if ((*req)->stash) {
+            free((*req)->stash->s);
+            free((*req)->stash);
+        }
         free(*req);
     }
 };
@@ -103,6 +108,22 @@ typedef struct {
     char *match;
 } find_tag_ctx;
 
+/* git rev-parse --verify refs/stash
+ * Appends "<oid>\n" on success; returns GIT_ENOTFOUND if no stash exists. */
+static int get_stash_oid(git_repository *repo, kstring_t *out) {
+    git_oid oid;
+    char hex[GIT_OID_MAX_HEXSIZE + 1];
+    int ret;
+
+    ret = git_reference_name_to_id(&oid, repo, "refs/stash");
+    if (ret < 0)
+        return ret;
+
+    git_oid_tostr(hex, sizeof(hex), &oid);
+    kputs(hex, out);
+    kputc('\n', out);
+    return 0;
+}
 /* git diff --ita-visible-in-index --cached --no-ext-diff --no-prefix --
  * (HEAD tree -> index, no pathspec) */
 static int get_staged(git_repository *repo, kstring_t *out) {
@@ -699,6 +720,9 @@ static void git_root_worker(uv_work_t *req) {
 
     data->is_bare = git_repository_is_bare(g_repo) ? 1 : 0;
 
+    data->stash = str_create(NULL, 0);
+    get_stash_oid(g_repo, data->stash);
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
@@ -733,7 +757,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .status = data->status,
         .diff = data->diff,
         .staged = data->staged,
-        .is_bare = data->is_bare
+        .is_bare = data->is_bare,
+        .stash = data->stash,
     };
     msgpack_handler_send(&res);
 }

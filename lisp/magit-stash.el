@@ -506,7 +506,49 @@ Then apply STASH, dropping it if it applies cleanly."
 (magit-define-section-jumper magit-jump-to-stashes
   "Stashes" stashes "refs/stash" magit-insert-stashes)
 
-(cl-defun magit-insert-stashes (&optional (ref   "refs/stash")
+(defun magit-rev-stash (git-info)
+  (if git-info
+      (let ((str (magit-info-get magit-info-stash-enum git-info)))
+        (if (string-empty-p str)
+          nil
+          str))
+  (magit-git-string-p "rev-parse" "--verify" "refs/stash")))
+
+(defun magit-insert-stashes ()
+  "Insert `stashes' section showing reflog for \"refs/stash\".
+If optional REF is non-nil, show reflog for that instead.
+If optional HEADING is non-nil, use that as section heading
+instead of \"Stashes:\"."
+  (let* (
+         (ref "refs/stash")
+         (heading "Stashes:")
+         (verified (magit-rev-stash git-info-for-hooks))
+        (autostash (magit-rebase--get-state-lines "autostash")))
+    (when (or autostash verified)
+      (magit-insert-section (stashes ref)
+        (magit-insert-heading heading)
+        (when autostash
+          (pcase-let ((`(,author ,date ,msg)
+                       (split-string
+                        (car (magit-git-lines
+                              "show" "-q" "--format=%aN%x00%at%x00%s"
+                              autostash))
+                        "\0")))
+            (magit-insert-section (stash autostash)
+              (insert (propertize "AUTOSTASH" 'font-lock-face 'magit-hash))
+              (insert " " msg "\n")
+              (save-excursion
+                (backward-char)
+                (magit-log-format-margin autostash author date)))))
+        (if verified
+            (magit-git-wash (apply-partially #'magit-log-wash-log 'stash)
+              "reflog" "--format=%gd%x00%aN%x00%at%x00%gs" ref)
+          (insert ?\n)
+          (save-excursion
+            (backward-char)
+            (magit-make-margin-overlay)))))))
+
+(cl-defun magit-insert-stashes-old (&optional (ref   "refs/stash")
                                           (heading "Stashes:"))
   "Insert `stashes' section showing reflog for \"refs/stash\".
 If optional REF is non-nil, show reflog for that instead.
