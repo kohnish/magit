@@ -21,6 +21,7 @@ typedef struct {
     kstring_t *worktree_porcelain;
     kstring_t *config_status_show_untracked_files;
     kstring_t *status;
+    kstring_t *diff;
     int result;
 } git_root_req_T;
 
@@ -88,6 +89,45 @@ typedef struct {
     const git_oid *target;
     char *match;
 } find_tag_ctx;
+
+/* git diff --ita-visible-in-index --no-ext-diff --no-prefix --
+ * (index -> worktree, no pathspec) */
+static int get_diff_patch(git_repository *repo, kstring_t *out) {
+    git_diff *diff = NULL;
+    git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
+    git_diff_find_options find_opts = GIT_DIFF_FIND_OPTIONS_INIT;
+    git_buf buf = GIT_BUF_INIT;
+    int ret;
+
+    /* git's default since 2.14; --ita-visible-in-index is also the default */
+    opts.flags = GIT_DIFF_NORMAL | GIT_DIFF_INDENT_HEURISTIC;
+
+    /* --no-prefix */
+    opts.old_prefix = "";
+    opts.new_prefix = "";
+
+    /* NULL index = use the repo's own index. No pathspec = whole tree. */
+    ret = git_diff_index_to_workdir(&diff, repo, NULL, &opts);
+    if (ret < 0)
+        goto out;
+
+    /* diff.renames defaults to true in git */
+    find_opts.flags = GIT_DIFF_FIND_RENAMES;
+    ret = git_diff_find_similar(diff, &find_opts);
+    if (ret < 0)
+        goto out;
+
+    ret = git_diff_to_buf(&buf, diff, GIT_DIFF_FORMAT_PATCH);
+    if (ret < 0)
+        goto out;
+
+    kputsn(buf.ptr, buf.size, out);
+
+out:
+    git_buf_dispose(&buf);
+    git_diff_free(diff);
+    return ret;
+}
 
 static int get_status_porcelain_z(git_repository *repo, kstring_t *out) {
     git_status_list *status = NULL;
@@ -576,6 +616,9 @@ static void git_root_worker(uv_work_t *req) {
     data->status = str_create(NULL, 0);
     int status_ret = get_status_porcelain_z(g_repo, data->status);
 
+    data->diff = str_create(NULL, 0);
+    int diff_ret = get_diff_patch(g_repo, data->diff);
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
@@ -607,7 +650,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .worktree_porcelain = data->worktree_porcelain,
         .dot_git_dir = g_dot_git_dir, // global
         .config_status_show_untracked_files = data->config_status_show_untracked_files,
-        .status = data->status
+        .status = data->status,
+        .diff = data->diff
     };
     msgpack_handler_send(&res);
 }

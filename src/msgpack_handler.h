@@ -24,6 +24,7 @@ typedef struct magit_res_T {
     kstring_t *dot_git_dir;
     kstring_t *config_status_show_untracked_files;
     kstring_t *status;
+    kstring_t *diff;
 } magit_res_T;
 
 #include <msgpack.h>
@@ -45,6 +46,7 @@ enum MAGIT_RES_KEY {
     MAGIT_RES_KEY_DOT_GIT_DIR,
     MAGIT_RES_KEY_CONFIG_STATUS_SHOW_UNTRACKED_FILES,
     MAGIT_RES_KEY_STATUS,
+    MAGIT_RES_KEY_DIFF,
 };
 
 int msgpack_handler_recv(uv_loop_t *loop, const char *data, size_t len);
