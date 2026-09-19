@@ -508,6 +508,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-config-status-show-untracked-files-enum 14)
 (defconst magit-info-status-enum 15)
 (defconst magit-info-diff-enum 16)
+(defconst magit-info-staged-enum 17)
 
 (defun magit-info-get (key info)
   (when info

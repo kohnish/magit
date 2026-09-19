@@ -3083,7 +3083,7 @@ It the SECTION has a different type, then do nothing."
 (magit-define-section-jumper magit-jump-to-unstaged
   "Unstaged changes" unstaged nil magit-insert-unstaged-changes)
 
-(defun magit--git-wash-new (insert-string)
+(defun magit--git-wash-diff-lines (insert-string)
   (declare (indent 2))
   (let ((beg (point)))
     (insert insert-string)
@@ -3104,7 +3104,7 @@ It the SECTION has a different type, then do nothing."
   (magit-insert-section (unstaged)
     (magit-insert-heading t "Unstaged changes")
     (if-let* ((diff-str (magit-info-get magit-info-diff-enum git-info-for-hooks)))
-        (magit--git-wash-new diff-str)
+        (magit--git-wash-diff-lines diff-str)
       (magit--insert-diff nil
         "diff" magit-buffer-diff-args "--no-prefix"
         "--" magit-buffer-diff-files))))
@@ -3123,15 +3123,31 @@ It the SECTION has a different type, then do nothing."
 (magit-define-section-jumper magit-jump-to-staged
   "Staged changes" staged nil magit-insert-staged-changes)
 
+(defun magit--git-wash-staged (insert-string)
+  (declare (indent 2))
+  (let ((beg (point)))
+    (insert insert-string)
+    (unless (bolp)
+      (insert "\n"))
+    (save-restriction
+      (narrow-to-region beg (point))
+      (goto-char beg)
+      (goto-char (line-beginning-position))
+      (magit-wash-sequence (apply-partially #'magit-diff-wash-diff '("diff" "--cached" "--no-ext-diff" "--no-prefix" "--")))
+      (insert ?\n))))
+
+;;
 (defun magit-insert-staged-changes ()
   "Insert section showing staged changes."
   ;; Avoid listing all files as deleted when visiting a bare repo.
   (unless (magit-bare-repo-p)
     (magit-insert-section (staged)
       (magit-insert-heading t "Staged changes")
-      (magit--insert-diff nil
-        "diff" "--cached" magit-buffer-diff-args "--no-prefix"
-        "--" magit-buffer-diff-files))))
+      (if-let* ((diff-str (magit-info-get magit-info-staged-enum git-info-for-hooks)))
+          (magit--git-wash-staged diff-str)
+        (magit--insert-diff nil
+          "diff" "--cached" magit-buffer-diff-args "--no-prefix"
+          "--" magit-buffer-diff-files)))))
 
 ;;; Diff Type
 
