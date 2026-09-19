@@ -642,6 +642,8 @@ line is inserted at all."
 
 (defun magit-refs--format-local-branches ()
   (let ((lines (seq-keep #'magit-refs--format-local-branch
+                         (if git-info-for-hooks
+                             (split-string (magit-info-get magit-info-branches-enum git-info-for-hooks) "\n" t)
                          (magit-git-lines
                           "for-each-ref"
                           (concat "--format=\
@@ -651,7 +653,7 @@ line is inserted at all."
 %(push:remotename)%00%(push)%00%(push:track)%00%(subject)"
                                     "%00%00%00%(subject)"))
                           "refs/heads"
-                          magit-buffer-arguments))))
+                          magit-buffer-arguments)))))
     (unless (magit-get-current-branch-v2 git-info-for-hooks)
       (push (magit-refs--format-local-branch
              (concat "*\0\0\0\0\0\0\0\0" (magit-rev-format "%s")))

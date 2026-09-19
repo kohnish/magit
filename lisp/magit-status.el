@@ -511,6 +511,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-staged-enum 17)
 (defconst magit-info-is-bare-enum 18)
 (defconst magit-info-stash-enum 19)
+(defconst magit-info-branches-enum 20)
 
 (defun magit-info-get (key info)
   (when info

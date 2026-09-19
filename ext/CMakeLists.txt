@@ -1,5 +1,7 @@
-add_library(klib INTERFACE)
-target_include_directories(klib INTERFACE
+add_library(klib STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/klib/kstring.c
+)
+target_include_directories(klib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/klib
 )
 

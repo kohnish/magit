@@ -28,6 +28,7 @@ typedef struct {
     kstring_t *staged;
     uint64_t is_bare;
     kstring_t *stash;
+    kstring_t *branches;
     int result;
 } git_root_req_T;
 
@@ -96,6 +97,10 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->stash->s);
             free((*req)->stash);
         }
+        if ((*req)->branches) {
+            free((*req)->branches->s);
+            free((*req)->branches);
+        }
         free(*req);
     }
 };
@@ -107,6 +112,133 @@ typedef struct {
     const git_oid *target;
     char *match;
 } find_tag_ctx;
+
+#include <string.h>
+#include <git2.h>
+#include <git2/sys/errors.h>   /* git_error_clear() */
+
+#define NUL(out) kputc('\0', (out))
+
+static const char *shorten_upstream(const char *name) {
+    if (strncmp(name, "refs/remotes/", sizeof("refs/remotes/") - 1) == 0)
+        return name + sizeof("refs/remotes/") - 1;
+    if (strncmp(name, "refs/heads/", sizeof("refs/heads/") - 1) == 0)
+        return name + sizeof("refs/heads/") - 1;
+    return name;
+}
+
+static int append_branch_record(git_repository *repo, git_reference *ref,
+                                kstring_t *out) {
+    const char *refname = git_reference_name(ref);
+    const char *short_name = NULL;
+    const char *up_name = NULL;
+    const char *subject = "";
+    git_buf up_buf = GIT_BUF_INIT;
+    git_commit *commit = NULL;
+    git_oid oid, up_oid;
+    size_t ahead = 0, behind = 0;
+    int track = 0;              /* 0 = none, 1 = counts, 2 = gone */
+    int is_head, have_oid, ret;
+
+    ret = git_branch_name(&short_name, ref);
+    if (ret < 0)
+        return ret;
+
+    is_head = (git_branch_is_head(ref) == 1);
+
+    /* Reads branch.<name>.remote/merge from config. Does NOT require the
+     * upstream ref to exist, which is what lets us report [gone]. */
+    ret = git_branch_upstream_name(&up_buf, repo, refname);
+    if (ret == 0) {
+        up_name = up_buf.ptr;
+    } else if (ret == GIT_ENOTFOUND) {
+        git_error_clear();
+    } else {
+        goto out;
+    }
+
+    /* name_to_id resolves symbolic refs too. */
+    have_oid = (git_reference_name_to_id(&oid, repo, refname) == 0);
+    if (!have_oid)
+        git_error_clear();
+
+    if (up_name && have_oid) {
+        if (git_reference_name_to_id(&up_oid, repo, up_name) == 0) {
+            ret = git_graph_ahead_behind(&ahead, &behind, repo, &oid, &up_oid);
+            if (ret < 0)
+                goto out;
+            track = 1;
+        } else {
+            git_error_clear();
+            track = 2;
+        }
+    }
+
+    if (have_oid && git_commit_lookup(&commit, repo, &oid) == 0) {
+        const char *s = git_commit_summary(commit);
+        if (s)
+            subject = s;
+    } else {
+        git_error_clear();
+    }
+
+    /* Everything is computed; now write the record. */
+    kputs(is_head ? "*" : " ", out);          NUL(out);
+    kputs(short_name, out);                   NUL(out);
+    kputs(refname, out);                      NUL(out);
+    kputs(up_name ? shorten_upstream(up_name) : "", out);  NUL(out);
+    kputs(up_name ? up_name : "", out);       NUL(out);
+
+    if (track == 1 && ahead && behind)
+        ksprintf(out, "[ahead %zu, behind %zu]", ahead, behind);
+    else if (track == 1 && ahead)
+        ksprintf(out, "[ahead %zu]", ahead);
+    else if (track == 1 && behind)
+        ksprintf(out, "[behind %zu]", behind);
+    else if (track == 2)
+        kputs("[gone]", out);
+
+    /* %00%00%00%00: one separator after track, two empty fields, and
+     * one separator before subject. */
+    NUL(out); NUL(out); NUL(out); NUL(out);
+
+    kputs(subject, out);
+    kputc('\n', out);
+    ret = 0;
+
+out:
+    git_commit_free(commit);
+    git_buf_dispose(&up_buf);
+    return ret;
+}
+
+/* git for-each-ref '--format=%(HEAD)%00%(refname:short)%00%(refname)%00
+ *   %(upstream:short)%00%(upstream)%00%(upstream:track)%00%00%00%00%(subject)'
+ *   refs/heads */
+static int get_branch_list(git_repository *repo, kstring_t *out) {
+    git_branch_iterator *iter = NULL;
+    git_reference *ref = NULL;
+    git_branch_t type;
+    int ret;
+
+    ret = git_branch_iterator_new(&iter, repo, GIT_BRANCH_LOCAL);
+    if (ret < 0)
+        return ret;
+
+    while ((ret = git_branch_next(&ref, &type, iter)) == 0) {
+        ret = append_branch_record(repo, ref, out);
+        git_reference_free(ref);
+        ref = NULL;
+        if (ret < 0)
+            goto out;
+    }
+    if (ret == GIT_ITEROVER)
+        ret = 0;
+
+out:
+    git_branch_iterator_free(iter);
+    return ret;
+}
 
 /* git rev-parse --verify refs/stash
  * Appends "<oid>\n" on success; returns GIT_ENOTFOUND if no stash exists. */
@@ -723,6 +855,9 @@ static void git_root_worker(uv_work_t *req) {
     data->stash = str_create(NULL, 0);
     get_stash_oid(g_repo, data->stash);
 
+    data->branches = str_create(NULL, 0);
+    get_branch_list(g_repo, data->branches);
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
@@ -759,6 +894,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .staged = data->staged,
         .is_bare = data->is_bare,
         .stash = data->stash,
+        .branches = data->branches,
     };
     msgpack_handler_send(&res);
 }
