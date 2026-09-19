@@ -29,6 +29,7 @@ typedef struct {
     uint64_t is_bare;
     kstring_t *stash;
     kstring_t *branches;
+    kstring_t *revision_by_idx;
     int result;
 } git_root_req_T;
 
@@ -100,6 +101,10 @@ static void git_root_request_cleanup(git_root_req_T **req) {
         if ((*req)->branches) {
             free((*req)->branches->s);
             free((*req)->branches);
+        }
+        if ((*req)->revision_by_idx) {
+            free((*req)->revision_by_idx->s);
+            free((*req)->revision_by_idx);
         }
         free(*req);
     }
@@ -256,6 +261,28 @@ static int get_stash_oid(git_repository *repo, kstring_t *out) {
     kputc('\n', out);
     return 0;
 }
+
+/* git rev-parse --verify <spec>
+ * Appends "<oid>\n" on success. Returns < 0 if the spec doesn't resolve. */
+static int get_rev_parse_verify(git_repository *repo, const char *spec,
+                                kstring_t *out) {
+    git_object *obj = NULL;
+    char hex[GIT_OID_MAX_HEXSIZE + 1];
+    int ret;
+
+    ret = git_revparse_single(&obj, repo, spec);
+    if (ret < 0)
+        return ret;
+
+    git_oid_tostr(hex, sizeof(hex), git_object_id(obj));
+    kputs(hex, out);
+    kputc('\n', out);
+
+    git_object_free(obj);
+    return 0;
+}
+
+
 /* git diff --ita-visible-in-index --cached --no-ext-diff --no-prefix --
  * (HEAD tree -> index, no pathspec) */
 static int get_staged(git_repository *repo, kstring_t *out) {
@@ -858,6 +885,10 @@ static void git_root_worker(uv_work_t *req) {
     data->branches = str_create(NULL, 0);
     get_branch_list(g_repo, data->branches);
 
+    data->revision_by_idx = str_create(NULL, 0);
+    get_rev_parse_verify(g_repo, "HEAD~30", data->revision_by_idx);
+
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
@@ -895,6 +926,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .is_bare = data->is_bare,
         .stash = data->stash,
         .branches = data->branches,
+        .revision_by_idx = data->revision_by_idx,
     };
     msgpack_handler_send(&res);
 }

@@ -1947,11 +1947,19 @@ then show the last `magit-log-section-commit-count' commits."
       (magit--insert-log nil "@{upstream}.." magit-buffer-log-args)
       (magit-log-insert-child-count))))
 
+(defun magit-rev-by-idx (git-info idx)
+  (if git-info
+      (let ((str (magit-info-get magit-info-rev-by-idx-enum git-info)))
+        (if (string-empty-p str)
+          nil
+          str))
+  (magit-git-string-p "rev-parse" "--verify" (format "HEAD~%s" idx))))
+
 (defun magit-insert-recent-commits (&optional type value)
   "Insert section showing recent commits.
 Show the last `magit-log-section-commit-count' commits."
   (let* ((start (format "HEAD~%s" magit-log-section-commit-count))
-         (range (and (magit-rev-verify start)
+         (range (and (magit-rev-by-idx git-info-for-hooks magit-log-section-commit-count)
                      (concat start "..HEAD"))))
     (magit-insert-section ((eval (or type 'recent))
                            (or value range)
