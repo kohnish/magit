@@ -1,10 +1,216 @@
 #include "kstring.h"
 #include "msgpack_handler.h"
 #include "util.h"
+#include <errno.h>
 #include <git2.h>
 #include <git2/sys/errors.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <time.h>
+
+/* ========================================================================
+ * Logging
+ *
+ * Configuration (environment variables, read once on first log call):
+ *   GIT_HANDLER_LOG_LEVEL  debug | info | warn | error | off   (default: info)
+ *   GIT_HANDLER_LOG_FILE   path to append to                    (default: stderr)
+ *
+ * Every message is formatted into a local buffer and written with a single
+ * fwrite(), so lines from the libuv worker threads and the main thread do not
+ * interleave. Never log to stdout: it may carry the msgpack stream.
+ * ======================================================================== */
+
+typedef enum {
+    GH_LOG_LEVEL_DEBUG = 0,
+    GH_LOG_LEVEL_INFO,
+    GH_LOG_LEVEL_WARN,
+    GH_LOG_LEVEL_ERROR,
+    GH_LOG_LEVEL_OFF,
+} gh_log_level_t;
+
+/* A worker step slower than this is reported at WARN instead of DEBUG. */
+#define GH_SLOW_STEP_MS 500
+
+static gh_log_level_t g_log_level = GH_LOG_LEVEL_INFO;
+static FILE *g_log_fp = NULL; /* NULL means stderr */
+static pthread_once_t g_log_once = PTHREAD_ONCE_INIT;
+
+static const char *gh_log_level_name(gh_log_level_t level) {
+    switch (level) {
+    case GH_LOG_LEVEL_DEBUG: return "DEBUG";
+    case GH_LOG_LEVEL_INFO:  return "INFO";
+    case GH_LOG_LEVEL_WARN:  return "WARN";
+    case GH_LOG_LEVEL_ERROR: return "ERROR";
+    default:                 return "?";
+    }
+}
+
+static gh_log_level_t gh_log_parse_level(const char *s, gh_log_level_t fallback) {
+    if (!s)
+        return fallback;
+    if (strcasecmp(s, "debug") == 0)
+        return GH_LOG_LEVEL_DEBUG;
+    if (strcasecmp(s, "info") == 0)
+        return GH_LOG_LEVEL_INFO;
+    if (strcasecmp(s, "warn") == 0 || strcasecmp(s, "warning") == 0)
+        return GH_LOG_LEVEL_WARN;
+    if (strcasecmp(s, "error") == 0)
+        return GH_LOG_LEVEL_ERROR;
+    if (strcasecmp(s, "off") == 0 || strcasecmp(s, "none") == 0)
+        return GH_LOG_LEVEL_OFF;
+    return fallback;
+}
+
+static void gh_log_init_once(void) {
+    const char *path = getenv("GIT_HANDLER_LOG_FILE");
+
+    g_log_level = gh_log_parse_level(getenv("GIT_HANDLER_LOG_LEVEL"), g_log_level);
+
+    if (path && *path) {
+        FILE *fp = fopen(path, "a");
+        if (fp) {
+            setvbuf(fp, NULL, _IOLBF, 0);
+            g_log_fp = fp;
+        } else {
+            fprintf(stderr, "git_handler: cannot open log file '%s': %s\n",
+                    path, strerror(errno));
+        }
+    }
+}
+
+static void gh_log(gh_log_level_t level, const char *func, int line,
+                   const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+
+static void gh_log(gh_log_level_t level, const char *func, int line,
+                   const char *fmt, ...) {
+    char msg[1024];
+    char buf[1280];
+    char ts[16];
+    struct timespec now;
+    struct tm tm;
+    va_list ap;
+    int n;
+
+    pthread_once(&g_log_once, gh_log_init_once);
+    if (level < g_log_level)
+        return;
+
+    clock_gettime(CLOCK_REALTIME, &now);
+    localtime_r(&now.tv_sec, &tm);
+    strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    n = snprintf(buf, sizeof(buf), "%s.%03ld [%-5s] [%lu] %s:%d: %s\n",
+                 ts, now.tv_nsec / 1000000L, gh_log_level_name(level),
+                 (unsigned long)(uintptr_t)pthread_self(), func, line, msg);
+    if (n < 0)
+        return;
+    if ((size_t)n >= sizeof(buf)) {   /* truncated: keep the trailing newline */
+        n = (int)sizeof(buf) - 1;
+        buf[n - 1] = '\n';
+    }
+    fwrite(buf, 1, (size_t)n, g_log_fp ? g_log_fp : stderr);
+}
+
+#define GH_LOG(level, ...) gh_log((level), __func__, __LINE__, __VA_ARGS__)
+#define GH_LOG_DEBUG(...)  GH_LOG(GH_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#define GH_LOG_INFO(...)   GH_LOG(GH_LOG_LEVEL_INFO,  __VA_ARGS__)
+#define GH_LOG_WARN(...)   GH_LOG(GH_LOG_LEVEL_WARN,  __VA_ARGS__)
+#define GH_LOG_ERROR(...)  GH_LOG(GH_LOG_LEVEL_ERROR, __VA_ARGS__)
+
+/* "Not found" and "unborn branch" are normal outcomes for many lookups
+ * (no stash, no upstream, fresh repo), so they log at DEBUG, not ERROR. */
+static gh_log_level_t gh_git_err_level(int code) {
+    return (code == GIT_ENOTFOUND || code == GIT_EUNBORNBRANCH)
+               ? GH_LOG_LEVEL_DEBUG
+               : GH_LOG_LEVEL_ERROR;
+}
+
+static void gh_log_git_error(gh_log_level_t level, const char *func, int line,
+                             int code, const char *fmt, ...)
+    __attribute__((format(printf, 5, 6)));
+
+/* Logs "<what> failed: code=N: <libgit2 message>". Call it BEFORE
+ * git_error_clear(), otherwise the message is gone. */
+static void gh_log_git_error(gh_log_level_t level, const char *func, int line,
+                             int code, const char *fmt, ...) {
+    const git_error *err = git_error_last();
+    char what[256];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(what, sizeof(what), fmt, ap);
+    va_end(ap);
+
+    gh_log(level, func, line, "%s failed: code=%d: %s", what, code,
+           (err && err->message) ? err->message : "no libgit2 error message");
+}
+
+#define GH_LOG_GIT_ERR(code, ...) \
+    gh_log_git_error(gh_git_err_level(code), __func__, __LINE__, (code), __VA_ARGS__)
+#define GH_LOG_GIT_ERR_AT(level, code, ...) \
+    gh_log_git_error((level), __func__, __LINE__, (code), __VA_ARGS__)
+
+/* Log and return / goto when a libgit2 call returned < 0. */
+#define GH_CHECK_RET(ret, ...)                     \
+    do {                                           \
+        if ((ret) < 0) {                           \
+            GH_LOG_GIT_ERR((ret), __VA_ARGS__);    \
+            return (ret);                          \
+        }                                          \
+    } while (0)
+
+#define GH_CHECK_GOTO(label, ret, ...)             \
+    do {                                           \
+        if ((ret) < 0) {                           \
+            GH_LOG_GIT_ERR((ret), __VA_ARGS__);    \
+            goto label;                            \
+        }                                          \
+    } while (0)
+
+/* ---- per-step timing for the worker ---- */
+
+static uint64_t gh_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void gh_log_step(const char *func, int line, const char *name, int rc,
+                        uint64_t ms, int optional) {
+    int slow = ms >= GH_SLOW_STEP_MS;
+    gh_log_level_t level = GH_LOG_LEVEL_DEBUG;
+
+    if ((rc != 0 && !optional) || slow)
+        level = GH_LOG_LEVEL_WARN;
+    gh_log(level, func, line, "step %s: rc=%d in %" PRIu64 " ms%s", name, rc, ms,
+           slow ? " (slow)" : "");
+}
+
+/* Runs `call`, stores its return value in rc_var, and logs rc + duration.
+ * GH_STEP_OPT is for steps whose failure is expected (no stash, short history). */
+#define GH_STEP_IMPL(rc_var, name, optional, call)                          \
+    do {                                                                    \
+        uint64_t t0_ = gh_now_ms();                                         \
+        git_error_clear();                                                  \
+        (rc_var) = (call);                                                  \
+        gh_log_step(__func__, __LINE__, (name), (rc_var), gh_now_ms() - t0_, \
+                    (optional));                                            \
+    } while (0)
+#define GH_STEP(rc_var, name, call)     GH_STEP_IMPL(rc_var, name, 0, call)
+#define GH_STEP_OPT(rc_var, name, call) GH_STEP_IMPL(rc_var, name, 1, call)
+
+/* ======================================================================== */
 
 typedef struct {
     uv_work_t req;
@@ -203,43 +409,41 @@ static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
 
     if (limit == 0)
         return 0;
-    if (commit_list_init(&list, limit) < 0)
+    if (commit_list_init(&list, limit) < 0) {
+        GH_LOG_ERROR("commit_list_init(%zu) failed: out of memory", limit);
         return -1;
+    }
 
     /* 1. Walk HEAD, newest first, at most `limit` commits. */
     ret = git_revwalk_new(&walk, repo);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_revwalk_new");
     git_revwalk_sorting(walk, GIT_SORT_TIME);
     ret = git_revwalk_push_head(walk);          /* fails on unborn HEAD */
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_revwalk_push_head");
 
     while (list.count < limit && (ret = git_revwalk_next(&oid, walk)) == 0) {
         ret = git_commit_lookup(&list.commits[list.count], repo, &oid);
-        if (ret < 0)
-            return ret;
+        GH_CHECK_RET(ret, "git_commit_lookup (commit #%zu)", list.count);
         list.count++;
     }
-    if (ret < 0 && ret != GIT_ITEROVER)
+    if (ret < 0 && ret != GIT_ITEROVER) {
+        GH_LOG_GIT_ERR(ret, "git_revwalk_next");
         return ret;
+    }
 
     ret = git_mailmap_from_repository(&mailmap, repo);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_mailmap_from_repository");
 
     /* 2. HEAD: attached to a branch, or detached. */
     ret = git_repository_head(&head, repo);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_repository_head");
     head_name = git_reference_name(head);       /* "refs/heads/x" or "HEAD" */
     head_attached = git_reference_is_branch(head);
     head_oid = git_reference_target(head);
 
     /* 3. Decorations: every ref whose peeled commit is in our list. */
     ret = git_reference_iterator_new(&iter, repo);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_reference_iterator_new");
 
     for (;;) {
         CLEANUP(cleanup_git_reference) git_reference *ref = NULL;
@@ -249,8 +453,7 @@ static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
         ret = git_reference_next(&ref, iter);
         if (ret == GIT_ITEROVER)
             break;
-        if (ret < 0)
-            return ret;
+        GH_CHECK_RET(ret, "git_reference_next");
 
         name = git_reference_name(ref);
         if (strncmp(name, "refs/prefetch/", 14) == 0 ||
@@ -259,6 +462,7 @@ static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
 
         /* Peels annotated tags and symbolic refs (origin/HEAD) to a commit. */
         if (git_reference_peel(&obj, ref, GIT_OBJECT_COMMIT) < 0) {
+            GH_LOG_DEBUG("skipping decoration for %s: cannot peel to a commit", name);
             git_error_clear();
             continue;
         }
@@ -270,8 +474,10 @@ static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
             int is_tag = strncmp(name, "refs/tags/", 10) == 0;
             size_t len = strlen(name) + 6;      /* "tag: " + name + NUL */
             char *s = malloc(len);
-            if (!s)
+            if (!s) {
+                GH_LOG_ERROR("malloc(%zu) failed for decoration of %s", len, name);
                 return -1;
+            }
             snprintf(s, len, "%s%s", is_tag ? "tag: " : "", name);
             kv_push(char *, list.decor[i], s);
             break;
@@ -288,8 +494,7 @@ static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
 
         /* %h */
         ret = git_object_short_id(&sid, (git_object *)c);
-        if (ret < 0)
-            return ret;
+        GH_CHECK_RET(ret, "git_object_short_id (commit #%zu)", i);
         kputs(sid.ptr, out);
         kputc(FF, out);
 
@@ -314,8 +519,7 @@ static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
 
         /* %aN, %at */
         ret = git_commit_author_with_mailmap(&sig, c, mailmap);
-        if (ret < 0)
-            return ret;
+        GH_CHECK_RET(ret, "git_commit_author_with_mailmap (commit #%zu)", i);
         kputs(sig->name, out);
         kputc(FF, out);
         put_i64(out, (long long)sig->when.time);
@@ -327,6 +531,7 @@ static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
         kputc('\n', out);
     }
 
+    GH_LOG_DEBUG("emitted %zu log entries (limit %zu)", list.count, limit);
     return 0;
 }
 
@@ -353,8 +558,7 @@ static int append_branch_record(git_repository *repo, git_reference *ref,
     int is_head, have_oid, ret;
 
     ret = git_branch_name(&short_name, ref);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_GOTO(out, ret, "git_branch_name(%s)", refname);
 
     is_head = (git_branch_is_head(ref) == 1);
 
@@ -366,21 +570,24 @@ static int append_branch_record(git_repository *repo, git_reference *ref,
     } else if (ret == GIT_ENOTFOUND) {
         git_error_clear();
     } else {
+        GH_LOG_GIT_ERR(ret, "git_branch_upstream_name(%s)", refname);
         goto out;
     }
 
     /* name_to_id resolves symbolic refs too. */
     have_oid = (git_reference_name_to_id(&oid, repo, refname) == 0);
-    if (!have_oid)
+    if (!have_oid) {
+        GH_LOG_DEBUG("cannot resolve %s to an oid", refname);
         git_error_clear();
+    }
 
     if (up_name && have_oid) {
         if (git_reference_name_to_id(&up_oid, repo, up_name) == 0) {
             ret = git_graph_ahead_behind(&ahead, &behind, repo, &oid, &up_oid);
-            if (ret < 0)
-                goto out;
+            GH_CHECK_GOTO(out, ret, "git_graph_ahead_behind(%s, %s)", refname, up_name);
             track = 1;
         } else {
+            GH_LOG_DEBUG("upstream %s of %s is gone", up_name, refname);
             git_error_clear();
             track = 2;
         }
@@ -391,6 +598,7 @@ static int append_branch_record(git_repository *repo, git_reference *ref,
         if (s)
             subject = s;
     } else {
+        GH_LOG_DEBUG("no commit summary available for %s", refname);
         git_error_clear();
     }
 
@@ -434,11 +642,16 @@ static int get_branch_list(git_repository *repo, kstring_t *out) {
     int ret;
 
     ret = git_branch_iterator_new(&iter, repo, GIT_BRANCH_LOCAL);
-    if (ret < 0)
+    if (ret < 0) {
+        GH_LOG_GIT_ERR(ret, "git_branch_iterator_new");
         return ret;
+    }
 
     while ((ret = git_branch_next(&ref, &type, iter)) == 0) {
         ret = append_branch_record(repo, ref, out);
+        if (ret < 0)
+            GH_LOG_ERROR("append_branch_record(%s) failed: code=%d",
+                         git_reference_name(ref), ret);
         git_reference_free(ref);
         ref = NULL;
         if (ret < 0)
@@ -446,6 +659,8 @@ static int get_branch_list(git_repository *repo, kstring_t *out) {
     }
     if (ret == GIT_ITEROVER)
         ret = 0;
+    else
+        GH_LOG_GIT_ERR(ret, "git_branch_next");
 
 out:
     git_branch_iterator_free(iter);
@@ -460,8 +675,7 @@ static int get_stash_oid(git_repository *repo, kstring_t *out) {
     int ret;
 
     ret = git_reference_name_to_id(&oid, repo, "refs/stash");
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_reference_name_to_id(refs/stash)");   /* ENOTFOUND -> DEBUG */
 
     git_oid_tostr(hex, sizeof(hex), &oid);
     kputs(hex, out);
@@ -478,8 +692,7 @@ static int get_rev_parse_verify(git_repository *repo, const char *spec,
     int ret;
 
     ret = git_revparse_single(&obj, repo, spec);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_revparse_single(%s)", spec);
 
     git_oid_tostr(hex, sizeof(hex), git_object_id(obj));
     kputs(hex, out);
@@ -504,23 +717,22 @@ static int get_staged(git_repository *repo, kstring_t *out) {
     int ret;
 
     ret = git_repository_index(&index, repo);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_repository_index");
 
     ret = git_index_read(index, 0);
-    if (ret < 0)
-        goto out;
+    GH_CHECK_GOTO(out, ret, "git_index_read");
 
     /* Unborn HEAD: leave head_tree NULL so we diff against the empty tree. */
     ret = git_repository_head(&head_ref, repo);
     if (ret == GIT_EUNBORNBRANCH || ret == GIT_ENOTFOUND) {
+        GH_LOG_DEBUG("HEAD is unborn, diffing index against the empty tree");
         git_error_clear();
     } else if (ret < 0) {
+        GH_LOG_GIT_ERR(ret, "git_repository_head");
         goto out;
     } else {
         ret = git_reference_peel(&head_obj, head_ref, GIT_OBJECT_TREE);
-        if (ret < 0)
-            goto out;
+        GH_CHECK_GOTO(out, ret, "git_reference_peel(HEAD -> tree)");
         head_tree = (git_tree *)head_obj;
     }
 
@@ -529,19 +741,17 @@ static int get_staged(git_repository *repo, kstring_t *out) {
     opts.new_prefix = "";
 
     ret = git_diff_tree_to_index(&diff, repo, head_tree, index, &opts);
-    if (ret < 0)
-        goto out;
+    GH_CHECK_GOTO(out, ret, "git_diff_tree_to_index");
 
     find_opts.flags = GIT_DIFF_FIND_RENAMES;
     ret = git_diff_find_similar(diff, &find_opts);
-    if (ret < 0)
-        goto out;
+    GH_CHECK_GOTO(out, ret, "git_diff_find_similar");
 
     ret = git_diff_to_buf(&buf, diff, GIT_DIFF_FORMAT_PATCH);
-    if (ret < 0)
-        goto out;
+    GH_CHECK_GOTO(out, ret, "git_diff_to_buf");
 
     kputsn(buf.ptr, buf.size, out);
+    GH_LOG_DEBUG("staged diff: %zu bytes", (size_t)buf.size);
 
 out:
     git_buf_dispose(&buf);
@@ -570,20 +780,18 @@ static int get_diff_patch(git_repository *repo, kstring_t *out) {
 
     /* NULL index = use the repo's own index. No pathspec = whole tree. */
     ret = git_diff_index_to_workdir(&diff, repo, NULL, &opts);
-    if (ret < 0)
-        goto out;
+    GH_CHECK_GOTO(out, ret, "git_diff_index_to_workdir");
 
     /* diff.renames defaults to true in git */
     find_opts.flags = GIT_DIFF_FIND_RENAMES;
     ret = git_diff_find_similar(diff, &find_opts);
-    if (ret < 0)
-        goto out;
+    GH_CHECK_GOTO(out, ret, "git_diff_find_similar");
 
     ret = git_diff_to_buf(&buf, diff, GIT_DIFF_FORMAT_PATCH);
-    if (ret < 0)
-        goto out;
+    GH_CHECK_GOTO(out, ret, "git_diff_to_buf");
 
     kputsn(buf.ptr, buf.size, out);
+    GH_LOG_DEBUG("worktree diff: %zu bytes", (size_t)buf.size);
 
 out:
     git_buf_dispose(&buf);
@@ -609,10 +817,10 @@ static int get_status_porcelain_z(git_repository *repo, kstring_t *out) {
      * instead of collapsing them to "dirname/". */
 
     ret = git_status_list_new(&status, repo, &opts);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_status_list_new");
 
     n = git_status_list_entrycount(status);
+    GH_LOG_DEBUG("status: %zu entries", n);
     for (i = 0; i < n; i++) {
         const git_status_entry *e = git_status_byindex(status, i);
         unsigned int s = e->status;
@@ -661,8 +869,10 @@ static int get_status_porcelain_z(git_repository *repo, kstring_t *out) {
                    e->head_to_index->new_file.path) != 0)
             old_path = e->head_to_index->old_file.path;
 
-        if (!path)
+        if (!path) {
+            GH_LOG_DEBUG("status entry %zu has no path (flags=0x%x), skipped", i, s);
             continue;
+        }
 
         kputc(X, out);
         kputc(Y, out);
@@ -687,13 +897,18 @@ static int get_config_status_show_untracked_files(git_repository *repo, kstring_
     int error;
 
     error = git_repository_config(&config, repo);
-    if (error < 0)
+    if (error < 0) {
+        GH_LOG_GIT_ERR(error, "git_repository_config");
         return error;
+    }
 
     error = git_config_get_string(&value, config, "status.showUntrackedFiles");
 
     if (error == 0 && value != NULL) {
         kputs(value, out);
+    } else if (error < 0) {
+        /* ENOTFOUND (option unset) is the common case and logs at DEBUG. */
+        GH_LOG_GIT_ERR(error, "git_config_get_string(status.showUntrackedFiles)");
     }
     git_config_free(config);
     return 0;
@@ -707,12 +922,14 @@ static int list_worktrees_porcelain(git_repository *repo, kstring_t *out) {
     /* ---- main worktree ---- */
     {
         const char *main_path = is_bare ? git_repository_path(repo) : git_repository_workdir(repo);
+        int head_ret;
 
         kputs("worktree ", out);
         kputs(main_path, out);
         kputc(0, out);
 
-        if (git_repository_head(&head_ref, repo) == 0) {
+        head_ret = git_repository_head(&head_ref, repo);
+        if (head_ret == 0) {
             char oidstr[GIT_OID_HEXSZ + 1];
             git_oid_tostr(oidstr, sizeof(oidstr), git_reference_target(head_ref));
 
@@ -729,6 +946,9 @@ static int list_worktrees_porcelain(git_repository *repo, kstring_t *out) {
                 kputc(0, out);
             }
             git_reference_free(head_ref);
+        } else {
+            /* unborn HEAD logs at DEBUG; anything else at ERROR */
+            GH_LOG_GIT_ERR(head_ret, "git_repository_head (main worktree %s)", main_path);
         }
         /* unborn HEAD case skipped here; real git prints an all-zero oid line */
 
@@ -742,23 +962,33 @@ static int list_worktrees_porcelain(git_repository *repo, kstring_t *out) {
 
     /* ---- linked worktrees ---- */
     ret = git_worktree_list(&wt_names, repo);
-    if (ret < 0)
+    if (ret < 0) {
+        GH_LOG_GIT_ERR(ret, "git_worktree_list");
         return ret;
+    }
+    GH_LOG_DEBUG("%zu linked worktree(s)", wt_names.count);
 
     for (size_t i = 0; i < wt_names.count; i++) {
         git_worktree *wt = NULL;
         git_repository *wt_repo = NULL;
         git_buf lock_reason = GIT_BUF_INIT;
+        int r;
 
-        if (git_worktree_lookup(&wt, repo, wt_names.strings[i]) < 0)
+        r = git_worktree_lookup(&wt, repo, wt_names.strings[i]);
+        if (r < 0) {
+            GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, r, "git_worktree_lookup(%s)",
+                              wt_names.strings[i]);
             continue;
+        }
 
         kputs("worktree ", out);
         kputs(git_worktree_path(wt), out);
         kputc(0, out);
 
-        if (git_repository_open_from_worktree(&wt_repo, wt) == 0) {
-            if (git_repository_head(&head_ref, wt_repo) == 0) {
+        r = git_repository_open_from_worktree(&wt_repo, wt);
+        if (r == 0) {
+            int head_ret = git_repository_head(&head_ref, wt_repo);
+            if (head_ret == 0) {
                 char oidstr[GIT_OID_HEXSZ + 1];
                 git_oid_tostr(oidstr, sizeof(oidstr), git_reference_target(head_ref));
 
@@ -775,8 +1005,15 @@ static int list_worktrees_porcelain(git_repository *repo, kstring_t *out) {
                     kputc(0, out);
                 }
                 git_reference_free(head_ref);
+            } else {
+                GH_LOG_GIT_ERR(head_ret, "git_repository_head (worktree %s)",
+                               wt_names.strings[i]);
             }
             git_repository_free(wt_repo);
+        } else {
+            GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, r,
+                              "git_repository_open_from_worktree(%s)",
+                              wt_names.strings[i]);
         }
 
         if (git_worktree_is_locked(&lock_reason, wt) > 0) {
@@ -807,8 +1044,10 @@ static int tag_cb(const char *name, git_oid *oid, void *payload)
     find_tag_ctx *ctx = payload;
     git_object *obj = NULL, *commit = NULL;
 
-    if (git_object_lookup(&obj, ctx->repo, oid, GIT_OBJECT_ANY) < 0)
+    if (git_object_lookup(&obj, ctx->repo, oid, GIT_OBJECT_ANY) < 0) {
+        GH_LOG_DEBUG("tag %s: object lookup failed, skipping", name);
         return 0;
+    }
 
     if (git_object_peel(&commit, obj, GIT_OBJECT_COMMIT) == 0 &&
         git_oid_equal(git_object_id(commit), ctx->target)) {
@@ -816,6 +1055,8 @@ static int tag_cb(const char *name, git_oid *oid, void *payload)
         if (strncmp(n, "refs/tags/", 10) == 0)
             n += 10;
         ctx->match = strdup(n);
+        if (!ctx->match)
+            GH_LOG_ERROR("strdup failed for tag %s", n);
         git_object_free(commit);
         git_object_free(obj);
         return 1; /* nonzero stops git_tag_foreach */
@@ -832,17 +1073,19 @@ static int get_tag_desc_if_match(git_repository *repo, kstring_t *out) {
     int ret;
 
     ret = git_revparse_single(&head, repo, "HEAD");
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_revparse_single(HEAD)");
 
     ctx.target = git_object_id(head);
 
     ret = git_tag_foreach(repo, tag_cb, &ctx);
     git_object_free(head);
-    if (ret < 0 && ret != GIT_ENOTFOUND)
+    if (ret < 0 && ret != GIT_ENOTFOUND) {
+        GH_LOG_GIT_ERR(ret, "git_tag_foreach");
         return ret;
+    }
 
     if (ctx.match) {
+        GH_LOG_DEBUG("HEAD is tagged: %s", ctx.match);
         kputs(ctx.match, out);
         free(ctx.match);
     }
@@ -859,22 +1102,23 @@ static int get_tag_desc(git_repository *repo, kstring_t *out) {
     int ret;
 
     ret = git_revparse_single(&head, repo, "HEAD");
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_revparse_single(HEAD)");
 
     opts.describe_strategy = GIT_DESCRIBE_TAGS;
 
     ret = git_describe_commit(&result, head, &opts);
     git_object_free(head);
 
-    if (ret < 0)
-        return ret;
+    /* ENOTFOUND here means no reachable tag; logged at DEBUG. */
+    GH_CHECK_RET(ret, "git_describe_commit");
 
     fmt.always_use_long_format = 1;
 
     ret = git_describe_format(&buf, result, &fmt);
     if (ret == 0)
         kputs(buf.ptr, out);
+    else
+        GH_LOG_GIT_ERR(ret, "git_describe_format");
 
     git_buf_dispose(&buf);
     git_describe_result_free(result);
@@ -889,17 +1133,17 @@ static int get_branch_upstream_name(git_repository *repo, const char *branch_nam
     int ret;
 
     ret = git_branch_lookup(&branch, repo, branch_name, GIT_BRANCH_LOCAL);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_branch_lookup(%s)", branch_name);
 
     ret = git_branch_upstream(&upstream, branch);
     git_reference_free(branch);
-    if (ret < 0)
-        return ret;
+    GH_CHECK_RET(ret, "git_branch_upstream(%s)", branch_name);   /* ENOTFOUND: no upstream */
 
     ret = git_branch_name(&name, upstream);
     if (ret == 0)
         kputs(name, out);
+    else
+        GH_LOG_GIT_ERR(ret, "git_branch_name(upstream of %s)", branch_name);
 
     git_reference_free(upstream);
     return ret;
@@ -912,14 +1156,18 @@ static int git_head_subject(git_repository *repo, kstring_t *out, const char *ta
     int error;
 
     error = git_reference_lookup(&head, repo, target);
-    if (error != 0)
+    if (error != 0) {
+        GH_LOG_GIT_ERR(error, "git_reference_lookup(%s)", target);
         return error;
+    }
 
     error = git_reference_peel(&obj, head, GIT_OBJECT_COMMIT);
     git_reference_free(head);
 
-    if (error != 0)
+    if (error != 0) {
+        GH_LOG_GIT_ERR(error, "git_reference_peel(%s -> commit)", target);
         return error;
+    }
 
     commit = (git_commit *)obj;
 
@@ -938,16 +1186,19 @@ static int git_symbolic_ref_short_head(git_repository *repo, kstring_t *out) {
 
     error = git_reference_lookup(&head_ref, repo, "HEAD");
     if (error != 0) {
+        GH_LOG_GIT_ERR(error, "git_reference_lookup(HEAD)");
         return error;
     }
 
     if (git_reference_type(head_ref) != GIT_REFERENCE_SYMBOLIC) {
+        GH_LOG_DEBUG("HEAD is not a symbolic ref (detached HEAD)");
         git_reference_free(head_ref);
         return GIT_ENOTFOUND;
     }
 
     target = git_reference_symbolic_target(head_ref);
     if (!target) {
+        GH_LOG_ERROR("HEAD is symbolic but has no target");
         git_reference_free(head_ref);
         return GIT_ERROR;
     }
@@ -958,6 +1209,8 @@ static int git_symbolic_ref_short_head(git_repository *repo, kstring_t *out) {
         if (strncmp(target, "refs/heads/", 11) == 0) {
             shorthand = target + 11;
         }
+        GH_LOG_DEBUG("HEAD -> %s does not resolve (unborn branch?), using '%s'",
+                     target, shorthand);
         kputs(shorthand, out);
         git_reference_free(head_ref);
         return 0;
@@ -989,11 +1242,13 @@ static int git_config_list_z(git_repository *repo, kstring_t *out) {
 
     error = git_repository_config(&cfg, repo);
     if (error != 0) {
+        GH_LOG_GIT_ERR(error, "git_repository_config");
         return error;
     }
 
     error = git_config_iterator_new(&iter, cfg);
     if (error != 0) {
+        GH_LOG_GIT_ERR(error, "git_config_iterator_new");
         git_config_free(cfg);
         return error;
     }
@@ -1010,6 +1265,9 @@ static int git_config_list_z(git_repository *repo, kstring_t *out) {
     git_config_iterator_free(iter);
     git_config_free(cfg);
 
+    if (error != GIT_ITEROVER)
+        GH_LOG_GIT_ERR(error, "git_config_next");
+
     return (error == GIT_ITEROVER) ? 0 : error;
 }
 
@@ -1017,10 +1275,12 @@ static int git_rev_head(git_repository *repo, char result_buf[GIT_OID_MAX_HEXSIZ
     git_reference *head = NULL;
     int error = git_repository_head(&head, repo);
     if (error != 0) {
+        GH_LOG_GIT_ERR(error, "git_repository_head");
         return error;
     }
     const git_oid *oid = git_reference_target(head);
     if (oid == NULL) {
+        GH_LOG_ERROR("HEAD reference %s has no direct target", git_reference_name(head));
         git_reference_free(head);
         return -1;
     }
@@ -1031,32 +1291,57 @@ static int git_rev_head(git_repository *repo, char result_buf[GIT_OID_MAX_HEXSIZ
 
 static void git_root_worker(uv_work_t *req) {
     git_root_req_T *data = req->data;
+    const uint64_t id = data->id;
+    const uint64_t t_start = gh_now_ms();
+
+    GH_LOG_DEBUG("request %" PRIu64 ": worker started", id);
+
+    if (!g_repo) {
+        GH_LOG_ERROR("request %" PRIu64 ": no repository is open "
+                     "(git_handler_repo_init not called or failed)", id);
+        return;
+    }
+
     const char *root = git_repository_workdir(g_repo);
     char oid_str[GIT_OID_MAX_HEXSIZE];
-    int rev_ret = git_rev_head(g_repo, oid_str);
+    int rev_ret;
+    GH_STEP(rev_ret, "rev_head", git_rev_head(g_repo, oid_str));
 
     data->list_z = str_create(NULL, 0);
-    int list_z_ret = git_config_list_z(g_repo, data->list_z);
+    int list_z_ret;
+    GH_STEP(list_z_ret, "config_list_z", git_config_list_z(g_repo, data->list_z));
 
     data->head_log_line = str_create(NULL, 0);
     data->subj = str_create(NULL, 0);
-    int subj_ret = git_head_subject(g_repo, data->subj, "HEAD");
+    int subj_ret;
+    GH_STEP(subj_ret, "head_subject", git_head_subject(g_repo, data->subj, "HEAD"));
 
     data->branch = str_create(NULL, 0);
-    int branch_ret = git_symbolic_ref_short_head(g_repo, data->branch);
+    int branch_ret;
+    GH_STEP(branch_ret, "symbolic_ref_short_head",
+            git_symbolic_ref_short_head(g_repo, data->branch));
     if (branch_ret != 0) {
+        GH_LOG_WARN("request %" PRIu64 ": aborting, cannot determine current branch "
+                    "(detached HEAD?) rc=%d", id, branch_ret);
         return;
     }
 
     data->upstream_branch = str_create(NULL, 0);
-    int upstream_branch_ret = get_branch_upstream_name(g_repo, data->branch->s, data->upstream_branch);
+    int upstream_branch_ret;
+    GH_STEP(upstream_branch_ret, "branch_upstream_name",
+            get_branch_upstream_name(g_repo, data->branch->s, data->upstream_branch));
     if (upstream_branch_ret != 0) {
+        GH_LOG_WARN("request %" PRIu64 ": aborting, branch '%s' has no upstream rc=%d",
+                    id, data->branch->s, upstream_branch_ret);
         return;
     }
 
     data->tag_desc = str_create(NULL, 0);
-    int tag_desc_ret = get_tag_desc(g_repo, data->tag_desc);
+    int tag_desc_ret;
+    GH_STEP(tag_desc_ret, "tag_desc", get_tag_desc(g_repo, data->tag_desc));
     if (tag_desc_ret != 0) {
+        GH_LOG_WARN("request %" PRIu64 ": aborting, git describe failed "
+                    "(no tags reachable from HEAD?) rc=%d", id, tag_desc_ret);
         return;
     }
 
@@ -1064,39 +1349,57 @@ static void git_root_worker(uv_work_t *req) {
     char target_str[] = "refs/remotes/";
     STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
     kputs(data->upstream_branch->s, target);
-    int upstream_subj_ret = git_head_subject(g_repo, data->upstream_subj, target->s);
+    int upstream_subj_ret;
+    GH_STEP(upstream_subj_ret, "upstream_subj",
+            git_head_subject(g_repo, data->upstream_subj, target->s));
 
     data->opt_tag_desc_head = str_create(NULL, 0);
-    int opt_tag_desc_head_ret = get_tag_desc_if_match(g_repo, data->opt_tag_desc_head);
+    int opt_tag_desc_head_ret;
+    GH_STEP(opt_tag_desc_head_ret, "tag_desc_if_match",
+            get_tag_desc_if_match(g_repo, data->opt_tag_desc_head));
 
     data->worktree_porcelain = str_create(NULL, 0);
-    int worktree_porcelain_ret = list_worktrees_porcelain(g_repo, data->worktree_porcelain);
+    int worktree_porcelain_ret;
+    GH_STEP(worktree_porcelain_ret, "worktrees_porcelain",
+            list_worktrees_porcelain(g_repo, data->worktree_porcelain));
 
     data->config_status_show_untracked_files = str_create(NULL, 0);
-    int config_status_show_untracked_files_ret = get_config_status_show_untracked_files(g_repo, data->config_status_show_untracked_files);
+    int config_status_show_untracked_files_ret;
+    GH_STEP(config_status_show_untracked_files_ret, "config_show_untracked_files",
+            get_config_status_show_untracked_files(g_repo, data->config_status_show_untracked_files));
 
     data->status = str_create(NULL, 0);
-    int status_ret = get_status_porcelain_z(g_repo, data->status);
+    int status_ret;
+    GH_STEP(status_ret, "status_porcelain_z", get_status_porcelain_z(g_repo, data->status));
 
     data->diff = str_create(NULL, 0);
-    int diff_ret = get_diff_patch(g_repo, data->diff);
+    int diff_ret;
+    GH_STEP(diff_ret, "diff_patch", get_diff_patch(g_repo, data->diff));
 
     data->staged = str_create(NULL, 0);
-    int staged_ret = get_staged(g_repo, data->staged);
+    int staged_ret;
+    GH_STEP(staged_ret, "staged", get_staged(g_repo, data->staged));
 
     data->is_bare = git_repository_is_bare(g_repo) ? 1 : 0;
 
+    /* The remaining steps do not gate the response; a failure here just
+     * means the field stays empty (no stash, history shorter than 30, ...). */
     data->stash = str_create(NULL, 0);
-    get_stash_oid(g_repo, data->stash);
+    int stash_ret;
+    GH_STEP_OPT(stash_ret, "stash_oid", get_stash_oid(g_repo, data->stash));
 
     data->branches = str_create(NULL, 0);
-    get_branch_list(g_repo, data->branches);
+    int branches_ret;
+    GH_STEP(branches_ret, "branch_list", get_branch_list(g_repo, data->branches));
 
     data->revision_by_idx = str_create(NULL, 0);
-    get_rev_parse_verify(g_repo, "HEAD~30", data->revision_by_idx);
+    int revision_ret;
+    GH_STEP_OPT(revision_ret, "rev_parse_HEAD~30",
+                get_rev_parse_verify(g_repo, "HEAD~30", data->revision_by_idx));
 
     data->logs = str_create(NULL, 0);
-    get_log(g_repo, 30, data->logs);
+    int logs_ret;
+    GH_STEP(logs_ret, "log", get_log(g_repo, 30, data->logs));
 
 
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
@@ -1107,12 +1410,34 @@ static void git_root_worker(uv_work_t *req) {
         kputs(data->subj->s, data->head_log_line);
         data->version = git_version_create();
         data->result = 0;
+    } else {
+        GH_LOG_ERROR("request %" PRIu64 ": incomplete result, no response will be sent: "
+                     "root=%s rev_head=%d config_list=%d head_subject=%d upstream_subj=%d "
+                     "tag_desc_head=%d worktrees=%d show_untracked=%d status=%d",
+                     id, root ? "ok" : "NULL (bare repo?)", rev_ret, list_z_ret, subj_ret,
+                     upstream_subj_ret, opt_tag_desc_head_ret, worktree_porcelain_ret,
+                     config_status_show_untracked_files_ret, status_ret);
     }
+
+    /* Non-gating steps: report failures that are not the expected ones. */
+    if (diff_ret != 0 || staged_ret != 0 || branches_ret != 0 || logs_ret != 0)
+        GH_LOG_WARN("request %" PRIu64 ": non-fatal step failures: diff=%d staged=%d "
+                    "branches=%d log=%d", id, diff_ret, staged_ret, branches_ret, logs_ret);
+
+    GH_LOG_DEBUG("request %" PRIu64 ": worker finished, result=%d, total %" PRIu64 " ms",
+                 id, data->result, gh_now_ms() - t_start);
 }
 
 static void after_git_root(uv_work_t *req, int status) {
     GIT_ROOT_REQUEST_CLEANUP git_root_req_T *data = req->data;
-    if (status != 0 || data->result < 0) {
+    if (status != 0) {
+        GH_LOG_ERROR("request %" PRIu64 ": work did not complete: %s (%d)",
+                     data->id, uv_strerror(status), status);
+        return;
+    }
+    if (data->result < 0) {
+        GH_LOG_WARN("request %" PRIu64 ": worker reported failure, dropping request "
+                    "(no response sent)", data->id);
         return;
     }
     magit_res_T res = {
@@ -1139,19 +1464,29 @@ static void after_git_root(uv_work_t *req, int status) {
         .revision_by_idx = data->revision_by_idx,
         .logs = data->logs,
     };
+    GH_LOG_DEBUG("request %" PRIu64 ": sending response", data->id);
     msgpack_handler_send(&res);
 }
 
 int git_handler_queue_git_status(uv_loop_t *loop, u_int64_t id, kstring_t *pwd) {
     GIT_ROOT_REQUEST_CLEANUP git_root_req_T *data = malloc(sizeof(*data));
+    if (!data) {
+        GH_LOG_ERROR("request %" PRIu64 ": malloc(%zu) failed", (uint64_t)id, sizeof(*data));
+        return -1;
+    }
     data->pwd = pwd;
     data->id = id;
     data->result = -1;
     data->req.data = data;
+    GH_LOG_DEBUG("request %" PRIu64 ": queueing git status for pwd=%s", (uint64_t)id,
+                 (pwd && pwd->s) ? pwd->s : "(null)");
     uv_work_t *req = &data->req;
     int ret = uv_queue_work(loop, req, git_root_worker, after_git_root);
     if (ret == 0) {
         xfer(data); // until after_git_root
+    } else {
+        GH_LOG_ERROR("request %" PRIu64 ": uv_queue_work failed: %s (%d)", (uint64_t)id,
+                     uv_strerror(ret), ret);
     }
     return ret;
 }
@@ -1159,16 +1494,36 @@ int git_handler_queue_git_status(uv_loop_t *loop, u_int64_t id, kstring_t *pwd) 
 int git_handler_repo_init(const char *path) {
     git_buf gitdir = GIT_BUF_INIT;
     kstring_t *out = str_create(NULL, 0);
-    int ret = git_repository_discover(&gitdir, path, 0, NULL);
+    int ret;
+
+    GH_LOG_INFO("opening repository at %s", path ? path : "(null)");
+
+    ret = git_repository_discover(&gitdir, path, 0, NULL);
     if (ret == 0) {
         kputs(gitdir.ptr, out);
         g_dot_git_dir = out;
         git_buf_dispose(&gitdir);
+        GH_LOG_DEBUG("discovered git dir %s", g_dot_git_dir->s);
+    } else {
+        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, ret, "git_repository_discover(%s)",
+                          path ? path : "(null)");
     }
-    return git_repository_open_ext(&g_repo, path, 0, NULL);
+
+    ret = git_repository_open_ext(&g_repo, path, 0, NULL);
+    if (ret < 0) {
+        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_ERROR, ret, "git_repository_open_ext(%s)",
+                          path ? path : "(null)");
+        return ret;
+    }
+
+    GH_LOG_INFO("repository opened: workdir=%s bare=%d",
+                git_repository_workdir(g_repo) ? git_repository_workdir(g_repo) : "(none)",
+                git_repository_is_bare(g_repo));
+    return ret;
 }
 
 void git_handler_repo_deinit() {
+    GH_LOG_INFO("closing repository");
     git_repository_free(g_repo);
     if (g_dot_git_dir) {
         free(g_dot_git_dir->s);
