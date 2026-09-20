@@ -313,6 +313,22 @@ static void git_root_request_cleanup(git_root_req_T **req) {
             free((*req)->revision_by_idx->s);
             free((*req)->revision_by_idx);
         }
+        if ((*req)->upstream_branch) {
+            free((*req)->upstream_branch->s);
+            free((*req)->upstream_branch);
+        }
+        if ((*req)->head_log_line) {
+            free((*req)->head_log_line->s);
+            free((*req)->head_log_line);
+        }
+        if ((*req)->tag_desc) {
+            free((*req)->tag_desc->s);
+            free((*req)->tag_desc);
+        }
+        if ((*req)->logs) {
+            free((*req)->logs->s);
+            free((*req)->logs);
+        }
         free(*req);
     }
 };
@@ -893,7 +909,7 @@ static int get_status_porcelain_z(git_repository *repo, kstring_t *out) {
 
 static int get_config_status_show_untracked_files(git_repository *repo, kstring_t *out) {
     git_config *config = NULL;
-    const char *value = NULL;
+    git_buf value = GIT_BUF_INIT;
     int error;
 
     error = git_repository_config(&config, repo);
@@ -902,14 +918,17 @@ static int get_config_status_show_untracked_files(git_repository *repo, kstring_
         return error;
     }
 
-    error = git_config_get_string(&value, config, "status.showUntrackedFiles");
+    /* git_config_get_string() rejects a live config object; the _buf variant
+     * works on it and copies the value, so no snapshot is needed. */
+    error = git_config_get_string_buf(&value, config, "status.showUntrackedFiles");
 
-    if (error == 0 && value != NULL) {
-        kputs(value, out);
+    if (error == 0 && value.ptr != NULL) {
+        kputs(value.ptr, out);
     } else if (error < 0) {
         /* ENOTFOUND (option unset) is the common case and logs at DEBUG. */
-        GH_LOG_GIT_ERR(error, "git_config_get_string(status.showUntrackedFiles)");
+        GH_LOG_GIT_ERR(error, "git_config_get_string_buf(status.showUntrackedFiles)");
     }
+    git_buf_dispose(&value);
     git_config_free(config);
     return 0;
 }
@@ -1109,8 +1128,12 @@ static int get_tag_desc(git_repository *repo, kstring_t *out) {
     ret = git_describe_commit(&result, head, &opts);
     git_object_free(head);
 
-    /* ENOTFOUND here means no reachable tag; logged at DEBUG. */
-    GH_CHECK_RET(ret, "git_describe_commit");
+    /* With no reachable tag libgit2 returns GIT_ERROR (-1), not ENOTFOUND.
+     * That is an expected outcome, so it is logged at DEBUG. */
+    if (ret < 0) {
+        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_DEBUG, ret, "git_describe_commit");
+        return ret;
+    }
 
     fmt.always_use_long_format = 1;
 
@@ -1271,7 +1294,7 @@ static int git_config_list_z(git_repository *repo, kstring_t *out) {
     return (error == GIT_ITEROVER) ? 0 : error;
 }
 
-static int git_rev_head(git_repository *repo, char result_buf[GIT_OID_MAX_HEXSIZE]) {
+static int git_rev_head(git_repository *repo, char result_buf[GIT_OID_MAX_HEXSIZE + 1]) {
     git_reference *head = NULL;
     int error = git_repository_head(&head, repo);
     if (error != 0) {
@@ -1303,7 +1326,7 @@ static void git_root_worker(uv_work_t *req) {
     }
 
     const char *root = git_repository_workdir(g_repo);
-    char oid_str[GIT_OID_MAX_HEXSIZE];
+    char oid_str[GIT_OID_MAX_HEXSIZE + 1];   /* +1 for the NUL git_oid_tostr writes */
     int rev_ret;
     GH_STEP(rev_ret, "rev_head", git_rev_head(g_repo, oid_str));
 
@@ -1316,42 +1339,50 @@ static void git_root_worker(uv_work_t *req) {
     int subj_ret;
     GH_STEP(subj_ret, "head_subject", git_head_subject(g_repo, data->subj, "HEAD"));
 
+    /* Detached HEAD and branches without an upstream are ordinary states, not
+     * failures: the corresponding fields simply stay empty and the response is
+     * still sent. */
     data->branch = str_create(NULL, 0);
     int branch_ret;
-    GH_STEP(branch_ret, "symbolic_ref_short_head",
-            git_symbolic_ref_short_head(g_repo, data->branch));
-    if (branch_ret != 0) {
-        GH_LOG_WARN("request %" PRIu64 ": aborting, cannot determine current branch "
-                    "(detached HEAD?) rc=%d", id, branch_ret);
-        return;
-    }
+    GH_STEP_OPT(branch_ret, "symbolic_ref_short_head",
+                git_symbolic_ref_short_head(g_repo, data->branch));
+    if (branch_ret != 0)
+        GH_LOG_DEBUG("request %" PRIu64 ": no current branch (detached HEAD?) rc=%d, "
+                     "branch left empty", id, branch_ret);
 
     data->upstream_branch = str_create(NULL, 0);
-    int upstream_branch_ret;
-    GH_STEP(upstream_branch_ret, "branch_upstream_name",
-            get_branch_upstream_name(g_repo, data->branch->s, data->upstream_branch));
-    if (upstream_branch_ret != 0) {
-        GH_LOG_WARN("request %" PRIu64 ": aborting, branch '%s' has no upstream rc=%d",
-                    id, data->branch->s, upstream_branch_ret);
-        return;
+    int upstream_branch_ret = -1;   /* stays -1 when the step is skipped */
+    if (branch_ret == 0) {
+        GH_STEP_OPT(upstream_branch_ret, "branch_upstream_name",
+                    get_branch_upstream_name(g_repo, data->branch->s, data->upstream_branch));
+        if (upstream_branch_ret != 0)
+            GH_LOG_DEBUG("request %" PRIu64 ": branch '%s' has no upstream rc=%d",
+                         id, data->branch->s, upstream_branch_ret);
+    } else {
+        GH_LOG_DEBUG("request %" PRIu64 ": skipping upstream lookup, no current branch", id);
     }
 
     data->tag_desc = str_create(NULL, 0);
     int tag_desc_ret;
-    GH_STEP(tag_desc_ret, "tag_desc", get_tag_desc(g_repo, data->tag_desc));
+    GH_STEP_OPT(tag_desc_ret, "tag_desc", get_tag_desc(g_repo, data->tag_desc));
     if (tag_desc_ret != 0) {
-        GH_LOG_WARN("request %" PRIu64 ": aborting, git describe failed "
-                    "(no tags reachable from HEAD?) rc=%d", id, tag_desc_ret);
-        return;
+        /* `git describe --tags` fails when no tag is reachable. That is not an
+         * error for status; tag_desc just stays empty. */
+        GH_LOG_DEBUG("request %" PRIu64 ": no tag description (no tags reachable "
+                     "from HEAD?) rc=%d, continuing", id, tag_desc_ret);
     }
 
     data->upstream_subj = str_create(NULL, 0);
-    char target_str[] = "refs/remotes/";
-    STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
-    kputs(data->upstream_branch->s, target);
-    int upstream_subj_ret;
-    GH_STEP(upstream_subj_ret, "upstream_subj",
-            git_head_subject(g_repo, data->upstream_subj, target->s));
+    int upstream_subj_ret = -1;     /* stays -1 when the step is skipped */
+    if (upstream_branch_ret == 0) {
+        char target_str[] = "refs/remotes/";
+        STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
+        kputs(data->upstream_branch->s, target);
+        /* Optional: fails e.g. when the upstream is a local branch, where
+         * "refs/remotes/<name>" does not exist. The subject just stays empty. */
+        GH_STEP_OPT(upstream_subj_ret, "upstream_subj",
+                    git_head_subject(g_repo, data->upstream_subj, target->s));
+    }
 
     data->opt_tag_desc_head = str_create(NULL, 0);
     int opt_tag_desc_head_ret;
@@ -1402,9 +1433,9 @@ static void git_root_worker(uv_work_t *req) {
     GH_STEP(logs_ret, "log", get_log(g_repo, 30, data->logs));
 
 
-    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && upstream_subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
+    if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
-        data->rev_head = str_create(oid_str, GIT_OID_MAX_HEXSIZE);
+        data->rev_head = str_create(oid_str, strlen(oid_str));
         kputs(data->rev_head->s, data->head_log_line);
         kputs(" ", data->head_log_line);
         kputs(data->subj->s, data->head_log_line);
@@ -1412,10 +1443,10 @@ static void git_root_worker(uv_work_t *req) {
         data->result = 0;
     } else {
         GH_LOG_ERROR("request %" PRIu64 ": incomplete result, no response will be sent: "
-                     "root=%s rev_head=%d config_list=%d head_subject=%d upstream_subj=%d "
+                     "root=%s rev_head=%d config_list=%d head_subject=%d "
                      "tag_desc_head=%d worktrees=%d show_untracked=%d status=%d",
                      id, root ? "ok" : "NULL (bare repo?)", rev_ret, list_z_ret, subj_ret,
-                     upstream_subj_ret, opt_tag_desc_head_ret, worktree_porcelain_ret,
+                     opt_tag_desc_head_ret, worktree_porcelain_ret,
                      config_status_show_untracked_files_ret, status_ret);
     }
 
@@ -1469,9 +1500,11 @@ static void after_git_root(uv_work_t *req, int status) {
 }
 
 int git_handler_queue_git_status(uv_loop_t *loop, u_int64_t id, kstring_t *pwd) {
-    GIT_ROOT_REQUEST_CLEANUP git_root_req_T *data = malloc(sizeof(*data));
+    /* calloc: the worker may return early, and cleanup must only ever see
+     * NULL or valid pointers in the fields it did not get to. */
+    GIT_ROOT_REQUEST_CLEANUP git_root_req_T *data = calloc(1, sizeof(*data));
     if (!data) {
-        GH_LOG_ERROR("request %" PRIu64 ": malloc(%zu) failed", (uint64_t)id, sizeof(*data));
+        GH_LOG_ERROR("request %" PRIu64 ": calloc(%zu) failed", (uint64_t)id, sizeof(*data));
         return -1;
     }
     data->pwd = pwd;

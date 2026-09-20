@@ -153,7 +153,7 @@
 ;;    callback))
 
 (defun magit-status-req (root callback)
-  (let ((root (expand-file-name "~/.emacs.d/elpa/magit")))
+  (let ((root (expand-file-name (directory-file-name (vc-root-dir)))))
     (require 'magit-client)
     (magit-server-start root)
     (magit-server-send-async
