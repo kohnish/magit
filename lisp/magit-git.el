@@ -2368,6 +2368,11 @@ and this option only controls what face is used.")
           (if (string-empty-p str)
               nil
             str)))
+       ((string-equal name "origin/HEAD")
+        (let ((str (magit-info-get magit-info-tag-origin-head-enum git-info)))
+          (if (string-empty-p str)
+              nil
+            str)))
        (t (magit-rev-verify (concat "refs/tags/" name))))
     (magit-rev-verify (concat "refs/tags/" name))))
 

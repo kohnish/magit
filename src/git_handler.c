@@ -241,6 +241,7 @@ typedef struct {
     kstring_t *tag_master;
     kstring_t *tag_origin_master;
     kstring_t *origin_head;
+    kstring_t *tag_origin_head;
     int result;
 } git_root_req_T;
 
@@ -1508,6 +1509,10 @@ static void git_root_worker(uv_work_t *req) {
     data->tag_origin_master = str_create(NULL, 0);
     get_ref_oid(g_repo, "refs/tags/origin/master", data->tag_origin_master);
 
+
+    data->tag_origin_head = str_create(NULL, 0);
+    get_ref_oid(g_repo, "refs/tags/origin/HEAD", data->tag_origin_head);
+
     data->origin_head = str_create(NULL, 0);
     get_origin_head(g_repo, data->origin_head);
 
@@ -1576,6 +1581,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .tag_master = data->tag_master,
         .tag_origin_master = data->tag_origin_master,
         .origin_head = data->origin_head,
+        .tag_origin_head = data->tag_origin_head,
     };
     GH_LOG_DEBUG("request %" PRIu64 ": sending response", data->id);
     msgpack_handler_send(&res);
