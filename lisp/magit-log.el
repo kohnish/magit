@@ -1347,8 +1347,7 @@ Do not add this to a hook variable."
   (let ((magit-log-count 0))
     (when (looking-at "^\\.\\.\\.")
       (magit-delete-line))
-    (magit-wash-sequence (apply-partially #'magit-log-wash-rev style
-                                          (magit-abbrev-length)))
+    (magit-wash-sequence (apply-partially #'magit-log-wash-rev style (if git-info-for-hooks (magit-info-get magit-info-rev-short-head-enum git-info-for-hooks) (magit-abbrev-length))))
     (if (derived-mode-p 'magit-log-mode 'magit-reflog-mode)
         (when (eq magit-log-count (magit-log-get-commit-limit))
           (magit-insert-section (longer)

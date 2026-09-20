@@ -237,6 +237,7 @@ typedef struct {
     kstring_t *branches;
     kstring_t *revision_by_idx;
     kstring_t *logs;
+    kstring_t *rev_short_head;
     int result;
 } git_root_req_T;
 
@@ -407,6 +408,26 @@ static void put_i64(kstring_t *out, long long n) {
     int len = snprintf(tmp, sizeof(tmp), "%lld", n);
     if (len > 0)
         kputsn(tmp, (size_t)len, out);
+}
+
+/* git rev-parse --short HEAD
+ * Appends "<abbrev-oid>\n" on success. Returns < 0 on unborn HEAD. */
+static int get_rev_parse_short_head(git_repository *repo, kstring_t *out) {
+    CLEANUP(cleanup_git_object) git_object *obj = NULL;
+    CLEANUP(cleanup_git_buf)    git_buf sid = GIT_BUF_INIT;
+    int ret;
+
+    ret = git_revparse_single(&obj, repo, "HEAD");
+    if (ret < 0)
+        return ret;
+
+    ret = git_object_short_id(&sid, obj);
+    if (ret < 0)
+        return ret;
+
+    kputs(sid.ptr, out);
+    kputc('\n', out);
+    return 0;
 }
 
 /* git log --format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%s --decorate=full
@@ -1433,6 +1454,11 @@ static void git_root_worker(uv_work_t *req) {
     GH_STEP(logs_ret, "log", get_log(g_repo, 30, data->logs));
 
 
+    data->rev_short_head = str_create(NULL, 0);
+    int rev_short_head;
+    GH_STEP(rev_short_head, "rev", get_rev_parse_short_head(g_repo, data->rev_short_head));
+
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, strlen(oid_str));
@@ -1494,6 +1520,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .branches = data->branches,
         .revision_by_idx = data->revision_by_idx,
         .logs = data->logs,
+        .rev_short_head = data->rev_short_head,
     };
     GH_LOG_DEBUG("request %" PRIu64 ": sending response", data->id);
     msgpack_handler_send(&res);
