@@ -2356,11 +2356,18 @@ In refs buffers the displayed text is controlled by other means
 and this option only controls what face is used.")
 
 (defun verify-tag-master (git-info name)
-  (if (and git-info (string-equal name "master"))
-      (let ((str (magit-info-get magit-info-tag-master-enum git-info)))
-        (if (string-empty-p str)
-            nil
-          str))
+  (if git-info
+      (cond
+       ((string-equal name "master")
+        (let ((str (magit-info-get magit-info-tag-master-enum git-info)))
+          (if (string-empty-p str)
+              nil
+            str)))
+       ((string-equal name "origin/master")
+        (let ((str (magit-info-get magit-info-tag-origin-master-enum git-info)))
+          (if (string-empty-p str)
+              nil
+            str))))
     (magit-rev-verify (concat "refs/tags/" name))))
 
 (defun magit-format-ref-labels (string)

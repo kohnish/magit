@@ -239,6 +239,8 @@ typedef struct {
     kstring_t *logs;
     kstring_t *rev_short_head;
     kstring_t *tag_master;
+    kstring_t *tag_origin_master;
+    kstring_t *origin_head;
     int result;
 } git_root_req_T;
 
@@ -429,6 +431,36 @@ static int get_rev_parse_short_head(git_repository *repo, kstring_t *out) {
     kputs(sid.ptr, out);
     kputc('\n', out);
     return 0;
+}
+
+/* git symbolic-ref <refname>
+ * Appends "<target-refname>\n" on success. Returns GIT_ENOTFOUND if the ref
+ * doesn't exist or isn't symbolic (git exits 128 in both cases). */
+static int get_symbolic_ref(git_repository *repo, const char *refname,
+                            kstring_t *out) {
+    CLEANUP(cleanup_git_reference) git_reference *ref = NULL;
+    const char *target;
+    int ret;
+
+    ret = git_reference_lookup(&ref, repo, refname);
+    GH_CHECK_RET(ret, "git_reference_lookup");   /* ENOTFOUND -> DEBUG */
+
+    if (git_reference_type(ref) != GIT_REFERENCE_SYMBOLIC)
+        return GIT_ENOTFOUND;
+
+    /* Owned by ref, so copy it out before ref is freed on return. */
+    target = git_reference_symbolic_target(ref);
+    if (!target)
+        return GIT_ENOTFOUND;
+
+    kputs(target, out);
+    kputc('\n', out);
+    return 0;
+}
+
+/* git symbolic-ref refs/remotes/origin/HEAD */
+static int get_origin_head(git_repository *repo, kstring_t *out) {
+    return get_symbolic_ref(repo, "refs/remotes/origin/HEAD", out);
 }
 
 /* git log --format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%s --decorate=full
@@ -1473,6 +1505,12 @@ static void git_root_worker(uv_work_t *req) {
     int tag_master;
     GH_STEP(tag_master, "tag_master", get_tag_master_oid(g_repo, data->tag_master));
 
+    data->tag_origin_master = str_create(NULL, 0);
+    get_ref_oid(g_repo, "refs/tags/origin/master", data->tag_origin_master);
+
+    data->origin_head = str_create(NULL, 0);
+    get_origin_head(g_repo, data->origin_head);
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, strlen(oid_str));
@@ -1536,6 +1574,8 @@ static void after_git_root(uv_work_t *req, int status) {
         .logs = data->logs,
         .rev_short_head = data->rev_short_head,
         .tag_master = data->tag_master,
+        .tag_origin_master = data->tag_origin_master,
+        .origin_head = data->origin_head,
     };
     GH_LOG_DEBUG("request %" PRIu64 ": sending response", data->id);
     msgpack_handler_send(&res);
