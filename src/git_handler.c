@@ -242,6 +242,7 @@ typedef struct {
     kstring_t *tag_origin_master;
     kstring_t *origin_head;
     kstring_t *tag_origin_head;
+    kstring_t *upstream_branch_master;
     int result;
 } git_root_req_T;
 
@@ -413,6 +414,35 @@ static void put_i64(kstring_t *out, long long n) {
     if (len > 0)
         kputsn(tmp, (size_t)len, out);
 }
+
+/* git rev-parse --verify --abbrev-ref <branch>@{upstream}
+ * Appends "<upstream-short-name>\n" (e.g. "origin/master") on success.
+ * Returns GIT_ENOTFOUND if the branch doesn't exist, has no upstream
+ * configured, or its upstream ref is gone (git exits 128 in all three). */
+static int get_upstream_branch(git_repository *repo, const char *branch_name, kstring_t *out) {
+    CLEANUP(cleanup_git_reference) git_reference *branch = NULL;
+    CLEANUP(cleanup_git_reference) git_reference *upstream = NULL;
+    const char *short_name = NULL;
+    int ret;
+
+    ret = git_branch_lookup(&branch, repo, branch_name, GIT_BRANCH_LOCAL);
+    GH_CHECK_RET(ret, "git_branch_lookup");            /* ENOTFOUND -> DEBUG */
+
+    ret = git_branch_upstream(&upstream, branch);
+    GH_CHECK_RET(ret, "git_branch_upstream");          /* ENOTFOUND -> DEBUG */
+
+    /* Strips "refs/remotes/" or "refs/heads/". The string is owned by
+     * `upstream`, so copy it out before the cleanup runs on return. */
+    ret = git_branch_name(&short_name, upstream);
+    GH_CHECK_RET(ret, "git_branch_name");
+
+    kputs(short_name, out);
+    kputc('\n', out);
+    return 0;
+}
+/* git rev-parse --verify --abbrev-ref master@{upstream} */
+/* usage: get_upstream_short(repo, "master", out); */
+
 
 /* git rev-parse --short HEAD
  * Appends "<abbrev-oid>\n" on success. Returns < 0 on unborn HEAD. */
@@ -1516,6 +1546,9 @@ static void git_root_worker(uv_work_t *req) {
     data->origin_head = str_create(NULL, 0);
     get_origin_head(g_repo, data->origin_head);
 
+    data->upstream_branch_master = str_create(NULL, 0);
+    get_upstream_branch(g_repo, "master", data->upstream_branch_master);
+
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
         data->rev_head = str_create(oid_str, strlen(oid_str));
@@ -1582,6 +1615,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .tag_origin_master = data->tag_origin_master,
         .origin_head = data->origin_head,
         .tag_origin_head = data->tag_origin_head,
+        .upstream_branch = data->upstream_branch,
     };
     GH_LOG_DEBUG("request %" PRIu64 ": sending response", data->id);
     msgpack_handler_send(&res);

@@ -1712,6 +1712,25 @@ according to the branch type."
                     'magit-branch-local
                   'magit-branch-remote)))))
 
+(defun magit-get-upstream-branch-master (git-info &optional branch)
+  "Return the name of the upstream branch of BRANCH.
+It BRANCH is nil, then return the upstream of the current branch
+if any, nil otherwise.  If the upstream is not configured, the
+configured remote is an url, or the named branch does not exist,
+then return nil.  I.e., return the name of an existing local or
+remote-tracking branch.  The returned string is colorized
+according to the branch type."
+  (if (and git-info (string-equal branch "master"))
+      (magit-info-get magit-info-upstream-branch-master-enum git-info)
+      (magit--with-refresh-cache
+          (list default-directory 'magit-get-upstream-branch branch)
+        (and-let* ((branch (or branch (magit-get-current-branch)))
+                   (upstream (magit-ref-abbrev (concat branch "@{upstream}"))))
+          (magit--propertize-face
+           upstream (if (equal (magit-get "branch" branch "remote") ".")
+                        'magit-branch-local
+                      'magit-branch-remote))))))
+
 (defun magit-get-upstream-branch-v2 (git-info &optional branch)
   (if git-info
       (magit-info-get magit-info-upstream-branch-enum git-info)
@@ -2427,7 +2446,7 @@ and this option only controls what face is used.")
                  name))
              remotes))
       (let* ((current (magit-get-current-branch-v2 git-info-for-hooks))
-             (target  (magit-get-upstream-branch current)))
+             (target  (magit-get-upstream-branch-master git-info-for-hooks current)))
         (dolist (name branches)
           (let ((push (car (member (magit-get-push-branch name) remotes))))
             (when push
