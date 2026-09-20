@@ -517,6 +517,7 @@ Type \\[magit-commit] to create a commit.
 (defconst magit-info-rev-short-head-enum 23)
 (defconst magit-info-tag-master-enum 24)
 (defconst magit-info-tag-origin-master-enum 25)
+(defconst magit-info-origin-head-enum 26)
 
 (defun magit-info-get (key info)
   (when info

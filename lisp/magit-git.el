@@ -2367,8 +2367,20 @@ and this option only controls what face is used.")
         (let ((str (magit-info-get magit-info-tag-origin-master-enum git-info)))
           (if (string-empty-p str)
               nil
-            str))))
+            str)))
+       (t (magit-rev-verify (concat "refs/tags/" name))))
     (magit-rev-verify (concat "refs/tags/" name))))
+
+(defun magit--origin-head (git-info remote-name)
+  (if git-info
+      (cond
+       ((string-equal remote-name "origin")
+        (let ((str (magit-info-get magit-info-origin-head-enum git-info)))
+          (if (string-empty-p str)
+              nil
+            str)))
+       (t (magit-git-string "symbolic-ref" (format "refs/remotes/%s/HEAD" remote-name))))
+    (magit-git-string "symbolic-ref" (format "refs/remotes/%s/HEAD" remote-name))))
 
 (defun magit-format-ref-labels (string)
   (save-match-data
@@ -2403,9 +2415,7 @@ and this option only controls what face is used.")
                          (b (match-string 2 name)))
                      (and (not (equal b "HEAD"))
                           (if (equal (concat "refs/remotes/" name)
-                                     (magit-git-string
-                                      "symbolic-ref"
-                                      (format "refs/remotes/%s/HEAD" r)))
+                                     (magit--origin-head git-info-for-hooks r))
                               (magit--propertize-face
                                name 'magit-branch-remote-head)
                             name)))
