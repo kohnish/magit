@@ -238,6 +238,7 @@ typedef struct {
     kstring_t *revision_by_idx;
     kstring_t *logs;
     kstring_t *rev_short_head;
+    kstring_t *tag_master;
     int result;
 } git_root_req_T;
 
@@ -704,20 +705,30 @@ out:
     return ret;
 }
 
-/* git rev-parse --verify refs/stash
- * Appends "<oid>\n" on success; returns GIT_ENOTFOUND if no stash exists. */
-static int get_stash_oid(git_repository *repo, kstring_t *out) {
+/* git rev-parse --verify <full-refname>
+ * Appends "<oid>\n" on success; returns GIT_ENOTFOUND if the ref doesn't exist. */
+static int get_ref_oid(git_repository *repo, const char *refname, kstring_t *out) {
     git_oid oid;
     char hex[GIT_OID_MAX_HEXSIZE + 1];
     int ret;
 
-    ret = git_reference_name_to_id(&oid, repo, "refs/stash");
-    GH_CHECK_RET(ret, "git_reference_name_to_id(refs/stash)");   /* ENOTFOUND -> DEBUG */
+    ret = git_reference_name_to_id(&oid, repo, refname);
+    GH_CHECK_RET(ret, "git_reference_name_to_id");   /* ENOTFOUND -> DEBUG */
 
     git_oid_tostr(hex, sizeof(hex), &oid);
     kputs(hex, out);
     kputc('\n', out);
     return 0;
+}
+
+/* git rev-parse --verify refs/stash */
+static int get_stash_oid(git_repository *repo, kstring_t *out) {
+    return get_ref_oid(repo, "refs/stash", out);
+}
+
+/* git rev-parse --verify refs/tags/master */
+static int get_tag_master_oid(git_repository *repo, kstring_t *out) {
+    return get_ref_oid(repo, "refs/tags/master", out);
 }
 
 /* git rev-parse --verify <spec>
@@ -1458,6 +1469,9 @@ static void git_root_worker(uv_work_t *req) {
     int rev_short_head;
     GH_STEP(rev_short_head, "rev", get_rev_parse_short_head(g_repo, data->rev_short_head));
 
+    data->tag_master = str_create(NULL, 0);
+    int tag_master;
+    GH_STEP(tag_master, "tag_master", get_tag_master_oid(g_repo, data->tag_master));
 
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
@@ -1521,6 +1535,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .revision_by_idx = data->revision_by_idx,
         .logs = data->logs,
         .rev_short_head = data->rev_short_head,
+        .tag_master = data->tag_master,
     };
     GH_LOG_DEBUG("request %" PRIu64 ": sending response", data->id);
     msgpack_handler_send(&res);

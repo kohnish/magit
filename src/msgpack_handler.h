@@ -32,6 +32,7 @@ typedef struct magit_res_T {
     kstring_t *revision_by_idx;
     kstring_t *logs;
     kstring_t *rev_short_head;
+    kstring_t *tag_master;
 } magit_res_T;
 
 #include <msgpack.h>
@@ -61,6 +62,7 @@ enum MAGIT_RES_KEY {
     MAGIT_RES_KEY_REV_IDX,
     MAGIT_RES_KEY_LOGS,
     MAGIT_RES_KEY_REV_SHORT_HEAD,
+    MAGIT_RES_KEY_TAG_MASTER,
 };
 
 int msgpack_handler_recv(uv_loop_t *loop, const char *data, size_t len);
