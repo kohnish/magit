@@ -1534,7 +1534,7 @@ static void git_root_worker(uv_work_t *req) {
 
     data->tag_master = str_create(NULL, 0);
     int tag_master;
-    GH_STEP(tag_master, "tag_master", get_tag_master_oid(g_repo, data->tag_master));
+    GH_STEP_OPT(tag_master, "tag_master", get_tag_master_oid(g_repo, data->tag_master));
 
     data->tag_origin_master = str_create(NULL, 0);
     get_ref_oid(g_repo, "refs/tags/origin/master", data->tag_origin_master);
@@ -1582,6 +1582,7 @@ static void after_git_root(uv_work_t *req, int status) {
                      data->id, uv_strerror(status), status);
         return;
     }
+    GH_LOG_DEBUG("request %" PRIu64 ": after_git_root called, result=%d", data->id, data->result);
     if (data->result < 0) {
         GH_LOG_WARN("request %" PRIu64 ": worker reported failure, dropping request "
                     "(no response sent)", data->id);

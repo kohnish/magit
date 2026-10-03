@@ -15,8 +15,12 @@
 
 static void append_key_val_str(msgpack_packer *packer, enum MAGIT_RES_KEY key, kstring_t *val) {
     msgpack_pack_int(packer, key);
-    msgpack_pack_str(packer, val->l);
-    msgpack_pack_str_body(packer, val->s, val->l);
+    if (val) {
+        msgpack_pack_str(packer, val->l);
+        msgpack_pack_str_body(packer, val->s, val->l);
+    } else {
+        msgpack_pack_str(packer, 0);
+    }
 }
 
 static void append_key_val_int(msgpack_packer *packer, enum MAGIT_RES_KEY key, uint64_t val) {

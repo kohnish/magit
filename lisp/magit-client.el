@@ -153,12 +153,13 @@
 ;;    callback))
 
 (defun magit-status-req (root callback)
-  (let ((root (expand-file-name (directory-file-name (vc-root-dir)))))
-    (require 'magit-client)
+  (require 'magit-client)
+  (let ((root (expand-file-name root))
+        (default-dir (expand-file-name default-directory)))
     (magit-server-start root)
     (magit-server-send-async
      root
-     (make-magit-status-msg :cmd-id 1 :default-dir default-directory)
+     (make-magit-status-msg :cmd-id 1 :default-dir default-dir)
      callback)))
 
 (provide 'magit-client)
