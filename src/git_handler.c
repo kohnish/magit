@@ -5,7 +5,6 @@
 #include <git2.h>
 #include <git2/sys/errors.h>
 #include <inttypes.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <uv.h>
 
 /* ========================================================================
  * Logging
@@ -248,6 +248,31 @@ typedef struct {
 
 git_repository *g_repo = NULL;
 kstring_t *g_dot_git_dir = NULL;
+
+/* Forward declarations for task wrapper functions */
+static int task_rev_head(git_repository *repo, kstring_t *out, void *arg);
+static int task_config_list_z(git_repository *repo, kstring_t *out, void *arg);
+static int task_head_subject(git_repository *repo, kstring_t *out, void *arg);
+static int task_symbolic_ref_short_head(git_repository *repo, kstring_t *out, void *arg);
+static int task_branch_upstream_name(git_repository *repo, kstring_t *out, void *arg);
+static int task_tag_desc(git_repository *repo, kstring_t *out, void *arg);
+static int task_tag_desc_if_match(git_repository *repo, kstring_t *out, void *arg);
+static int task_worktrees_porcelain(git_repository *repo, kstring_t *out, void *arg);
+static int task_config_show_untracked(git_repository *repo, kstring_t *out, void *arg);
+static int task_status_porcelain_z(git_repository *repo, kstring_t *out, void *arg);
+static int task_diff_patch(git_repository *repo, kstring_t *out, void *arg);
+static int task_staged(git_repository *repo, kstring_t *out, void *arg);
+static int task_stash_oid(git_repository *repo, kstring_t *out, void *arg);
+static int task_branch_list(git_repository *repo, kstring_t *out, void *arg);
+static int task_rev_parse_verify(git_repository *repo, kstring_t *out, void *arg);
+static int task_log(git_repository *repo, kstring_t *out, void *arg);
+static int task_rev_parse_short_head(git_repository *repo, kstring_t *out, void *arg);
+static int task_tag_master(git_repository *repo, kstring_t *out, void *arg);
+static int task_tag_origin_master(git_repository *repo, kstring_t *out, void *arg);
+static int task_tag_origin_head(git_repository *repo, kstring_t *out, void *arg);
+static int task_origin_head(git_repository *repo, kstring_t *out, void *arg);
+static int task_upstream_branch_master(git_repository *repo, kstring_t *out, void *arg);
+static int task_upstream_subj(git_repository *repo, kstring_t *out, void *arg);
 
 static void git_root_request_cleanup(git_root_req_T **req) {
     if (req && *req) {
@@ -1407,6 +1432,102 @@ static int git_rev_head(git_repository *repo, char result_buf[GIT_OID_MAX_HEXSIZ
     return 0;
 }
 
+/* Task wrapper function implementations - after all functions they call */
+static int task_rev_head(git_repository *repo, kstring_t *out, void *arg) {
+    char *oid_str = (char *)arg;
+    return git_rev_head(repo, oid_str);
+}
+
+static int task_config_list_z(git_repository *repo, kstring_t *out, void *arg) {
+    return git_config_list_z(repo, out);
+}
+
+static int task_head_subject(git_repository *repo, kstring_t *out, void *arg) {
+    return git_head_subject(repo, out, "HEAD");
+}
+
+static int task_symbolic_ref_short_head(git_repository *repo, kstring_t *out, void *arg) {
+    return git_symbolic_ref_short_head(repo, out);
+}
+
+static int task_branch_upstream_name(git_repository *repo, kstring_t *out, void *arg) {
+    char *branch_name = (char *)arg;
+    return get_branch_upstream_name(repo, branch_name, out);
+}
+
+static int task_tag_desc(git_repository *repo, kstring_t *out, void *arg) {
+    return get_tag_desc(repo, out);
+}
+
+static int task_tag_desc_if_match(git_repository *repo, kstring_t *out, void *arg) {
+    return get_tag_desc_if_match(repo, out);
+}
+
+static int task_worktrees_porcelain(git_repository *repo, kstring_t *out, void *arg) {
+    return list_worktrees_porcelain(repo, out);
+}
+
+static int task_config_show_untracked(git_repository *repo, kstring_t *out, void *arg) {
+    return get_config_status_show_untracked_files(repo, out);
+}
+
+static int task_status_porcelain_z(git_repository *repo, kstring_t *out, void *arg) {
+    return get_status_porcelain_z(repo, out);
+}
+
+static int task_diff_patch(git_repository *repo, kstring_t *out, void *arg) {
+    return get_diff_patch(repo, out);
+}
+
+static int task_staged(git_repository *repo, kstring_t *out, void *arg) {
+    return get_staged(repo, out);
+}
+
+static int task_stash_oid(git_repository *repo, kstring_t *out, void *arg) {
+    return get_stash_oid(repo, out);
+}
+
+static int task_branch_list(git_repository *repo, kstring_t *out, void *arg) {
+    return get_branch_list(repo, out);
+}
+
+static int task_rev_parse_verify(git_repository *repo, kstring_t *out, void *arg) {
+    return get_rev_parse_verify(repo, "HEAD~30", out);
+}
+
+static int task_log(git_repository *repo, kstring_t *out, void *arg) {
+    return get_log(repo, 30, out);
+}
+
+static int task_rev_parse_short_head(git_repository *repo, kstring_t *out, void *arg) {
+    return get_rev_parse_short_head(repo, out);
+}
+
+static int task_tag_master(git_repository *repo, kstring_t *out, void *arg) {
+    return get_tag_master_oid(repo, out);
+}
+
+static int task_tag_origin_master(git_repository *repo, kstring_t *out, void *arg) {
+    return get_ref_oid(repo, "refs/tags/origin/master", out);
+}
+
+static int task_tag_origin_head(git_repository *repo, kstring_t *out, void *arg) {
+    return get_ref_oid(repo, "refs/tags/origin/HEAD", out);
+}
+
+static int task_origin_head(git_repository *repo, kstring_t *out, void *arg) {
+    return get_origin_head(repo, out);
+}
+
+static int task_upstream_branch_master(git_repository *repo, kstring_t *out, void *arg) {
+    return get_upstream_branch(repo, "master", out);
+}
+
+static int task_upstream_subj(git_repository *repo, kstring_t *out, void *arg) {
+    char *target = (char *)arg;
+    return git_head_subject(repo, out, target);
+}
+
 static void git_root_worker(uv_work_t *req) {
     git_root_req_T *data = req->data;
     const uint64_t id = data->id;
@@ -1422,34 +1543,83 @@ static void git_root_worker(uv_work_t *req) {
 
     const char *root = git_repository_workdir(g_repo);
     char oid_str[GIT_OID_MAX_HEXSIZE + 1];   /* +1 for the NUL git_oid_tostr writes */
-    int rev_ret;
-    GH_STEP(rev_ret, "rev_head", git_rev_head(g_repo, oid_str));
+    uv_loop_t *loop = data->req.loop;
 
+    /* Phase 1: Independent tasks - run directly (we're already in a worker thread) */
     data->list_z = str_create(NULL, 0);
-    int list_z_ret;
-    GH_STEP(list_z_ret, "config_list_z", git_config_list_z(g_repo, data->list_z));
+    int list_z_ret = task_config_list_z(g_repo, data->list_z, NULL);
 
     data->head_log_line = str_create(NULL, 0);
     data->subj = str_create(NULL, 0);
-    int subj_ret;
-    GH_STEP(subj_ret, "head_subject", git_head_subject(g_repo, data->subj, "HEAD"));
+    int subj_ret = task_head_subject(g_repo, data->subj, NULL);
 
-    /* Detached HEAD and branches without an upstream are ordinary states, not
-     * failures: the corresponding fields simply stay empty and the response is
-     * still sent. */
+    int rev_ret = task_rev_head(g_repo, NULL, oid_str);
+
+    data->tag_desc = str_create(NULL, 0);
+    int tag_desc_ret = task_tag_desc(g_repo, data->tag_desc, NULL);
+
+    data->opt_tag_desc_head = str_create(NULL, 0);
+    int opt_tag_desc_head_ret = task_tag_desc_if_match(g_repo, data->opt_tag_desc_head, NULL);
+
+    data->worktree_porcelain = str_create(NULL, 0);
+    int worktree_porcelain_ret = task_worktrees_porcelain(g_repo, data->worktree_porcelain, NULL);
+
+    data->config_status_show_untracked_files = str_create(NULL, 0);
+    int config_status_show_untracked_files_ret = task_config_show_untracked(g_repo, data->config_status_show_untracked_files, NULL);
+
+    data->status = str_create(NULL, 0);
+    int status_ret = task_status_porcelain_z(g_repo, data->status, NULL);
+
+    data->diff = str_create(NULL, 0);
+    int diff_ret = task_diff_patch(g_repo, data->diff, NULL);
+
+    data->staged = str_create(NULL, 0);
+    int staged_ret = task_staged(g_repo, data->staged, NULL);
+
+    data->stash = str_create(NULL, 0);
+    int stash_ret = task_stash_oid(g_repo, data->stash, NULL);
+
+    data->branches = str_create(NULL, 0);
+    int branches_ret = task_branch_list(g_repo, data->branches, NULL);
+
+    data->revision_by_idx = str_create(NULL, 0);
+    int revision_ret = task_rev_parse_verify(g_repo, data->revision_by_idx, NULL);
+
+    data->logs = str_create(NULL, 0);
+    int logs_ret = task_log(g_repo, data->logs, NULL);
+
+    data->rev_short_head = str_create(NULL, 0);
+    int rev_short_head = task_rev_parse_short_head(g_repo, data->rev_short_head, NULL);
+
+    data->tag_master = str_create(NULL, 0);
+    int tag_master = task_tag_master(g_repo, data->tag_master, NULL);
+
+    data->tag_origin_master = str_create(NULL, 0);
+    int tag_origin_master_ret = task_tag_origin_master(g_repo, data->tag_origin_master, NULL);
+
+    data->tag_origin_head = str_create(NULL, 0);
+    int tag_origin_head_ret = task_tag_origin_head(g_repo, data->tag_origin_head, NULL);
+
+    data->origin_head = str_create(NULL, 0);
+    int origin_head_ret = task_origin_head(g_repo, data->origin_head, NULL);
+
+    data->upstream_branch_master = str_create(NULL, 0);
+    int upstream_branch_master_ret = task_upstream_branch_master(g_repo, data->upstream_branch_master, NULL);
+
+    data->is_bare = git_repository_is_bare(g_repo) ? 1 : 0;
+
+    /* Phase 2: Tasks that depend on branch */
     data->branch = str_create(NULL, 0);
-    int branch_ret;
-    GH_STEP_OPT(branch_ret, "symbolic_ref_short_head",
-                git_symbolic_ref_short_head(g_repo, data->branch));
+    int branch_ret = task_symbolic_ref_short_head(g_repo, data->branch, NULL);
     if (branch_ret != 0)
         GH_LOG_DEBUG("request %" PRIu64 ": no current branch (detached HEAD?) rc=%d, "
                      "branch left empty", id, branch_ret);
 
+    /* Phase 3: Tasks that depend on upstream_branch */
     data->upstream_branch = str_create(NULL, 0);
-    int upstream_branch_ret = -1;   /* stays -1 when the step is skipped */
+    int upstream_branch_ret = -1;
     if (branch_ret == 0) {
-        GH_STEP_OPT(upstream_branch_ret, "branch_upstream_name",
-                    get_branch_upstream_name(g_repo, data->branch->s, data->upstream_branch));
+        upstream_branch_ret = task_branch_upstream_name(g_repo, data->upstream_branch, data->branch->s);
         if (upstream_branch_ret != 0)
             GH_LOG_DEBUG("request %" PRIu64 ": branch '%s' has no upstream rc=%d",
                          id, data->branch->s, upstream_branch_ret);
@@ -1457,97 +1627,22 @@ static void git_root_worker(uv_work_t *req) {
         GH_LOG_DEBUG("request %" PRIu64 ": skipping upstream lookup, no current branch", id);
     }
 
-    data->tag_desc = str_create(NULL, 0);
-    int tag_desc_ret;
-    GH_STEP_OPT(tag_desc_ret, "tag_desc", get_tag_desc(g_repo, data->tag_desc));
+    /* Phase 4: Tasks that depend on upstream_subj */
+    data->upstream_subj = str_create(NULL, 0);
+    int upstream_subj_ret = -1;
+    if (upstream_branch_ret == 0) {
+        char target_str[] = "refs/remotes/";
+        STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
+        kputs(data->upstream_branch->s, target);
+        upstream_subj_ret = task_upstream_subj(g_repo, data->upstream_subj, target->s);
+    }
+
     if (tag_desc_ret != 0) {
         /* `git describe --tags` fails when no tag is reachable. That is not an
          * error for status; tag_desc just stays empty. */
         GH_LOG_DEBUG("request %" PRIu64 ": no tag description (no tags reachable "
                      "from HEAD?) rc=%d, continuing", id, tag_desc_ret);
     }
-
-    data->upstream_subj = str_create(NULL, 0);
-    int upstream_subj_ret = -1;     /* stays -1 when the step is skipped */
-    if (upstream_branch_ret == 0) {
-        char target_str[] = "refs/remotes/";
-        STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
-        kputs(data->upstream_branch->s, target);
-        /* Optional: fails e.g. when the upstream is a local branch, where
-         * "refs/remotes/<name>" does not exist. The subject just stays empty. */
-        GH_STEP_OPT(upstream_subj_ret, "upstream_subj",
-                    git_head_subject(g_repo, data->upstream_subj, target->s));
-    }
-
-    data->opt_tag_desc_head = str_create(NULL, 0);
-    int opt_tag_desc_head_ret;
-    GH_STEP(opt_tag_desc_head_ret, "tag_desc_if_match",
-            get_tag_desc_if_match(g_repo, data->opt_tag_desc_head));
-
-    data->worktree_porcelain = str_create(NULL, 0);
-    int worktree_porcelain_ret;
-    GH_STEP(worktree_porcelain_ret, "worktrees_porcelain",
-            list_worktrees_porcelain(g_repo, data->worktree_porcelain));
-
-    data->config_status_show_untracked_files = str_create(NULL, 0);
-    int config_status_show_untracked_files_ret;
-    GH_STEP(config_status_show_untracked_files_ret, "config_show_untracked_files",
-            get_config_status_show_untracked_files(g_repo, data->config_status_show_untracked_files));
-
-    data->status = str_create(NULL, 0);
-    int status_ret;
-    GH_STEP(status_ret, "status_porcelain_z", get_status_porcelain_z(g_repo, data->status));
-
-    data->diff = str_create(NULL, 0);
-    int diff_ret;
-    GH_STEP(diff_ret, "diff_patch", get_diff_patch(g_repo, data->diff));
-
-    data->staged = str_create(NULL, 0);
-    int staged_ret;
-    GH_STEP(staged_ret, "staged", get_staged(g_repo, data->staged));
-
-    data->is_bare = git_repository_is_bare(g_repo) ? 1 : 0;
-
-    /* The remaining steps do not gate the response; a failure here just
-     * means the field stays empty (no stash, history shorter than 30, ...). */
-    data->stash = str_create(NULL, 0);
-    int stash_ret;
-    GH_STEP_OPT(stash_ret, "stash_oid", get_stash_oid(g_repo, data->stash));
-
-    data->branches = str_create(NULL, 0);
-    int branches_ret;
-    GH_STEP(branches_ret, "branch_list", get_branch_list(g_repo, data->branches));
-
-    data->revision_by_idx = str_create(NULL, 0);
-    int revision_ret;
-    GH_STEP_OPT(revision_ret, "rev_parse_HEAD~30",
-                get_rev_parse_verify(g_repo, "HEAD~30", data->revision_by_idx));
-
-    data->logs = str_create(NULL, 0);
-    int logs_ret;
-    GH_STEP(logs_ret, "log", get_log(g_repo, 30, data->logs));
-
-
-    data->rev_short_head = str_create(NULL, 0);
-    int rev_short_head;
-    GH_STEP(rev_short_head, "rev", get_rev_parse_short_head(g_repo, data->rev_short_head));
-
-    data->tag_master = str_create(NULL, 0);
-    int tag_master;
-    GH_STEP_OPT(tag_master, "tag_master", get_tag_master_oid(g_repo, data->tag_master));
-
-    data->tag_origin_master = str_create(NULL, 0);
-    get_ref_oid(g_repo, "refs/tags/origin/master", data->tag_origin_master);
-
-
-    data->tag_origin_head = str_create(NULL, 0);
-    get_ref_oid(g_repo, "refs/tags/origin/HEAD", data->tag_origin_head);
-
-    data->origin_head = str_create(NULL, 0);
-    get_origin_head(g_repo, data->origin_head);
-
-    data->upstream_branch_master = str_create(NULL, 0);
-    get_upstream_branch(g_repo, "master", data->upstream_branch_master);
 
     if (root && rev_ret == 0 && list_z_ret == 0 && subj_ret == 0 && opt_tag_desc_head_ret == 0 && worktree_porcelain_ret == 0 && config_status_show_untracked_files_ret == 0 && status_ret == 0) {
         data->root = str_create(root, strlen(root) - 1); // trim last slash
