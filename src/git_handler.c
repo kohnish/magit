@@ -216,6 +216,9 @@ typedef struct {
     uv_work_t req;
     uint64_t id;
     kstring_t *pwd;
+    kstring_t *repo_path;
+    kstring_t *dot_git_dir;
+    git_repository *repo;
     kstring_t *root;
     kstring_t *rev_head;
     kstring_t *list_z;
@@ -276,9 +279,20 @@ static int task_upstream_subj(git_repository *repo, kstring_t *out, void *arg);
 
 static void git_root_request_cleanup(git_root_req_T **req) {
     if (req && *req) {
+        if ((*req)->repo) {
+            git_repository_free((*req)->repo);
+        }
         if ((*req)->pwd) {
             free((*req)->pwd->s);
             free((*req)->pwd);
+        }
+        if ((*req)->repo_path) {
+            free((*req)->repo_path->s);
+            free((*req)->repo_path);
+        }
+        if ((*req)->dot_git_dir) {
+            free((*req)->dot_git_dir->s);
+            free((*req)->dot_git_dir);
         }
         if ((*req)->root) {
             free((*req)->root->s);
@@ -1532,18 +1546,20 @@ static void git_root_worker(uv_work_t *req) {
     git_root_req_T *data = req->data;
     const uint64_t id = data->id;
     const uint64_t t_start = gh_now_ms();
+    git_repository *g_repo = NULL;
 
     GH_LOG_DEBUG("request %" PRIu64 ": worker started", id);
 
-    if (!g_repo) {
-        GH_LOG_ERROR("request %" PRIu64 ": no repository is open "
-                     "(git_handler_repo_init not called or failed)", id);
+    int open_ret = git_repository_open_ext(&g_repo, data->repo_path->s, 0, NULL);
+    if (open_ret < 0) {
+        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_ERROR, open_ret,
+                          "git_repository_open_ext(%s)", data->repo_path->s);
         return;
     }
+    data->repo = g_repo;
 
     const char *root = git_repository_workdir(g_repo);
-    char oid_str[GIT_OID_MAX_HEXSIZE + 1];   /* +1 for the NUL git_oid_tostr writes */
-    uv_loop_t *loop = data->req.loop;
+    char oid_str[GIT_OID_MAX_HEXSIZE + 1];
 
     /* Phase 1: Independent tasks - run directly (we're already in a worker thread) */
     data->list_z = str_create(NULL, 0);
@@ -1696,7 +1712,7 @@ static void after_git_root(uv_work_t *req, int status) {
         .opt_tag_desc_head = data->opt_tag_desc_head,
         .version = data->version,
         .worktree_porcelain = data->worktree_porcelain,
-        .dot_git_dir = g_dot_git_dir, // global
+        .dot_git_dir = data->dot_git_dir,
         .config_status_show_untracked_files = data->config_status_show_untracked_files,
         .status = data->status,
         .diff = data->diff,
@@ -1728,6 +1744,21 @@ int git_handler_queue_git_status(uv_loop_t *loop, u_int64_t id, kstring_t *pwd) 
     data->pwd = pwd;
     data->id = id;
     data->result = -1;
+    if (!g_repo) {
+        GH_LOG_ERROR("request %" PRIu64 ": no repository is open "
+                     "(git_handler_repo_init not called or failed)", (uint64_t)id);
+        return -1;
+    }
+    const char *repo_path = git_repository_workdir(g_repo);
+    if (!repo_path)
+        repo_path = git_repository_path(g_repo);
+    if (!repo_path) {
+        GH_LOG_ERROR("request %" PRIu64 ": repository has no usable path", (uint64_t)id);
+        return -1;
+    }
+    data->repo_path = str_create(repo_path, strlen(repo_path));
+    if (g_dot_git_dir)
+        data->dot_git_dir = str_create(g_dot_git_dir->s, g_dot_git_dir->l);
     data->req.data = data;
     GH_LOG_DEBUG("request %" PRIu64 ": queueing git status for pwd=%s", (uint64_t)id,
                  (pwd && pwd->s) ? pwd->s : "(null)");
