@@ -2,9 +2,14 @@
 #include "msgpack_handler.h"
 #include "util.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <git2.h>
+#include <git2/sys/commit_graph.h>
 #include <git2/sys/errors.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,7 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 #include <uv.h>
 
 /* ========================================================================
@@ -397,7 +404,6 @@ typedef struct {
 #include <git2.h>
 #include <git2/sys/errors.h>
 #include "kstring.h"
-#include "kvec.h"
 
 #define FF '\x0c'
 #define CLEANUP(fn) __attribute__((cleanup(fn)))
@@ -408,51 +414,10 @@ typedef struct {
             free_fn(*p);                                     \
     }
 
-DEFINE_CLEANUP(git_revwalk,            git_revwalk_free)
-DEFINE_CLEANUP(git_mailmap,            git_mailmap_free)
 DEFINE_CLEANUP(git_reference,          git_reference_free)
-DEFINE_CLEANUP(git_reference_iterator, git_reference_iterator_free)
 DEFINE_CLEANUP(git_object,             git_object_free)
-DEFINE_CLEANUP(git_signature,          git_signature_free)
 
 static inline void cleanup_git_buf(git_buf *b) { git_buf_dispose(b); }
-
-/* ---- commit list: malloc'd arrays plus per-commit decoration names ---- */
-
-typedef kvec_t(char *) namevec_t;
-
-typedef struct {
-    git_commit **commits;   /* calloc'd, `count` slots filled */
-    namevec_t   *decor;     /* calloc'd, one vector per slot  */
-    size_t       count;
-    size_t       cap;
-} commit_list_t;
-
-static int commit_list_init(commit_list_t *l, size_t cap) {
-    l->count = 0;
-    l->cap = cap;
-    l->commits = calloc(cap, sizeof(*l->commits));
-    l->decor = calloc(cap, sizeof(*l->decor));
-    return (l->commits && l->decor) ? 0 : -1;
-}
-
-static void commit_list_free(commit_list_t *l) {
-    for (size_t i = 0; i < l->count; i++) {
-        for (size_t j = 0; j < kv_size(l->decor[i]); j++)
-            free(kv_A(l->decor[i], j));
-        kv_destroy(l->decor[i]);
-        git_commit_free(l->commits[i]);
-    }
-    free(l->decor);
-    free(l->commits);
-}
-
-static void put_i64(kstring_t *out, long long n) {
-    char tmp[32];
-    int len = snprintf(tmp, sizeof(tmp), "%lld", n);
-    if (len > 0)
-        kputsn(tmp, (size_t)len, out);
-}
 
 /* git rev-parse --verify --abbrev-ref <branch>@{upstream}
  * Appends "<upstream-short-name>\n" (e.g. "origin/master") on success.
@@ -533,146 +498,299 @@ static int get_origin_head(git_repository *repo, kstring_t *out) {
     return get_symbolic_ref(repo, "refs/remotes/origin/HEAD", out);
 }
 
-/* git log --format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%s --decorate=full
- *         -n<limit> --use-mailmap --no-prefix --                      */
-static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
-    CLEANUP(commit_list_free)             commit_list_t list = {0};
-    CLEANUP(cleanup_git_revwalk)          git_revwalk *walk = NULL;
-    CLEANUP(cleanup_git_mailmap)          git_mailmap *mailmap = NULL;
-    CLEANUP(cleanup_git_reference)        git_reference *head = NULL;
-    CLEANUP(cleanup_git_reference_iterator) git_reference_iterator *iter = NULL;
-    const char *head_name;
-    const git_oid *head_oid;
-    int head_attached;
-    git_oid oid;
-    int ret;
+/* Load commit-graph for the repository to enable fast history queries.
+ * This is done once per repository and the commit-graph is automatically
+ * used by revwalk operations. */
+static int load_commit_graph(git_repository *repo) {
+    git_odb *odb = NULL;
+    git_commit_graph *cgraph = NULL;
+    int ret = 0;
 
-    if (limit == 0)
-        return 0;
-    if (commit_list_init(&list, limit) < 0) {
-        GH_LOG_ERROR("commit_list_init(%zu) failed: out of memory", limit);
-        return -1;
-    }
-
-    /* 1. Walk HEAD, newest first, at most `limit` commits. */
-    ret = git_revwalk_new(&walk, repo);
-    GH_CHECK_RET(ret, "git_revwalk_new");
-    git_revwalk_sorting(walk, GIT_SORT_TIME);
-    ret = git_revwalk_push_head(walk);          /* fails on unborn HEAD */
-    GH_CHECK_RET(ret, "git_revwalk_push_head");
-
-    while (list.count < limit && (ret = git_revwalk_next(&oid, walk)) == 0) {
-        ret = git_commit_lookup(&list.commits[list.count], repo, &oid);
-        GH_CHECK_RET(ret, "git_commit_lookup (commit #%zu)", list.count);
-        list.count++;
-    }
-    if (ret < 0 && ret != GIT_ITEROVER) {
-        GH_LOG_GIT_ERR(ret, "git_revwalk_next");
+    /* Get the object database */
+    ret = git_repository_odb(&odb, repo);
+    if (ret < 0) {
+        GH_LOG_DEBUG("Failed to get ODB for commit-graph loading: %d", ret);
         return ret;
     }
 
-    ret = git_mailmap_from_repository(&mailmap, repo);
-    GH_CHECK_RET(ret, "git_mailmap_from_repository");
+    /* Get the repository path */
+    const char *repo_path = git_repository_path(repo);
+    if (!repo_path) {
+        GH_LOG_DEBUG("Failed to get repository path for commit-graph");
+        git_odb_free(odb);
+        return -1;
+    }
 
-    /* 2. HEAD: attached to a branch, or detached. */
-    ret = git_repository_head(&head, repo);
-    GH_CHECK_RET(ret, "git_repository_head");
-    head_name = git_reference_name(head);       /* "refs/heads/x" or "HEAD" */
-    head_attached = git_reference_is_branch(head);
-    head_oid = git_reference_target(head);
+    /* Build the objects/info directory path */
+    size_t path_len = strlen(repo_path) + strlen("objects/info") + 1;
+    char *objects_info_path = malloc(path_len);
+    if (!objects_info_path) {
+        GH_LOG_ERROR("malloc failed for objects info path");
+        git_odb_free(odb);
+        return -1;
+    }
+    snprintf(objects_info_path, path_len, "%sobjects/info", repo_path);
 
-    /* 3. Decorations: every ref whose peeled commit is in our list. */
-    ret = git_reference_iterator_new(&iter, repo);
-    GH_CHECK_RET(ret, "git_reference_iterator_new");
+    /* Try to open the commit-graph file */
+    ret = git_commit_graph_open(&cgraph, objects_info_path);
+    free(objects_info_path);
+    if (ret < 0) {
+        /* Commit-graph may not exist, which is fine */
+        GH_LOG_DEBUG("No commit-graph found (code=%d)", ret);
+        git_odb_free(odb);
+        return 0; /* Not an error - commit-graph is optional */
+    }
 
-    for (;;) {
-        CLEANUP(cleanup_git_reference) git_reference *ref = NULL;
-        CLEANUP(cleanup_git_object)    git_object *obj = NULL;
-        const char *name;
+    /* Attach the commit-graph to the ODB */
+    ret = git_odb_set_commit_graph(odb, cgraph);
+    if (ret < 0) {
+        GH_LOG_ERROR("Failed to set commit-graph on ODB: %d", ret);
+        git_commit_graph_free(cgraph);
+        git_odb_free(odb);
+        return ret;
+    }
 
-        ret = git_reference_next(&ref, iter);
-        if (ret == GIT_ITEROVER)
+    GH_LOG_INFO("Successfully loaded commit-graph");
+    git_odb_free(odb);
+    /* Ownership of cgraph is transferred to libgit2 */
+    return 0;
+}
+
+/* Git's commit-graph optimizations keep these history queries fast on large repositories. */
+static int run_git_capture(git_repository *repo, kstring_t *out,
+                           char *const argv[]) {
+    const char *path = git_repository_workdir(repo);
+    size_t output_start = out->l;
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    char error_output[2048];
+    size_t error_length = 0;
+    pid_t pid;
+    int status;
+    int ret = 0;
+    int stdout_open = 1;
+    int stderr_open = 1;
+
+    if (!path)
+        path = git_repository_path(repo);
+    if (!path) {
+        GH_LOG_ERROR("repository has no path for Git subprocess");
+        return -1;
+    }
+    if (pipe(stdout_pipe) < 0) {
+        GH_LOG_ERROR("pipe failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pipe(stderr_pipe) < 0) {
+        int saved_errno = errno;
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        GH_LOG_ERROR("pipe failed: %s", strerror(saved_errno));
+        return -1;
+    }
+    if (fcntl(stdout_pipe[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(stdout_pipe[1], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(stderr_pipe[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(stderr_pipe[1], F_SETFD, FD_CLOEXEC) < 0) {
+        int saved_errno = errno;
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
+        GH_LOG_ERROR("fcntl(FD_CLOEXEC) failed: %s", strerror(saved_errno));
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        int saved_errno = errno;
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
+        GH_LOG_ERROR("fork failed: %s", strerror(saved_errno));
+        return -1;
+    }
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(stderr_pipe[1], STDERR_FILENO) < 0)
+            _exit(126);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+    while (stdout_open || stderr_open) {
+        struct pollfd fds[] = {
+            { .fd = stdout_open ? stdout_pipe[0] : -1, .events = POLLIN },
+            { .fd = stderr_open ? stderr_pipe[0] : -1, .events = POLLIN }
+        };
+        int ready = poll(fds, 2, -1);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            GH_LOG_ERROR("poll for Git subprocess output failed: %s",
+                         strerror(errno));
+            ret = -1;
             break;
-        GH_CHECK_RET(ret, "git_reference_next");
+        }
+        for (int i = 0; i < 2; i++) {
+            if (fds[i].fd < 0 || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
+                continue;
+            char buffer[8192];
+            ssize_t n = read(fds[i].fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                if (i == 0) {
+                    kputsn(buffer, (size_t)n, out);
+                } else {
+                    size_t copy = sizeof(error_output) - 1 - error_length;
+                    if (copy > (size_t)n)
+                        copy = (size_t)n;
+                    memcpy(error_output + error_length, buffer, copy);
+                    error_length += copy;
+                }
+            } else if (n == 0) {
+                if (i == 0) {
+                    close(stdout_pipe[0]);
+                    stdout_open = 0;
+                } else {
+                    close(stderr_pipe[0]);
+                    stderr_open = 0;
+                }
+            } else if (errno != EINTR) {
+                GH_LOG_ERROR("reading Git subprocess output failed: %s",
+                             strerror(errno));
+                ret = -1;
+                break;
+            }
+        }
+        if (ret < 0)
+            break;
+    }
+    if (stdout_open)
+        close(stdout_pipe[0]);
+    if (stderr_open)
+        close(stderr_pipe[0]);
 
-        name = git_reference_name(ref);
-        if (strncmp(name, "refs/prefetch/", 14) == 0 ||
-            (head_attached && strcmp(name, head_name) == 0))
-            continue;   /* current branch is printed via "HEAD -> ..." */
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+        if (out->s) {
+            out->l = output_start;
+            out->s[output_start] = '\0';
+        }
+        GH_LOG_ERROR("waitpid for Git subprocess failed: %s", strerror(errno));
+        return -1;
+    }
+    error_output[error_length] = '\0';
+    if (ret < 0) {
+        if (out->s) {
+            out->l = output_start;
+            out->s[output_start] = '\0';
+        }
+        return ret;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (out->s) {
+            out->l = output_start;
+            out->s[output_start] = '\0';
+        }
+        GH_LOG_DEBUG("Git subprocess failed (status=%d): %s",
+                     WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                     error_output);
+        return -1;
+    }
+    return 0;
+}
 
-        /* Peels annotated tags and symbolic refs (origin/HEAD) to a commit. */
-        if (git_reference_peel(&obj, ref, GIT_OBJECT_COMMIT) < 0) {
-            GH_LOG_DEBUG("skipping decoration for %s: cannot peel to a commit", name);
-            git_error_clear();
+/* git log --format=%h%x0c%D%x0c%x0c%aN%x0c%at%x0c%s --decorate=full
+ *         -n<limit> --use-mailmap --no-prefix --                      */
+static int get_log(git_repository *repo, size_t limit, kstring_t *out) {
+    git_revwalk *walker = NULL;
+    git_commit *commit = NULL;
+    git_oid oid;
+    size_t count = 0;
+    int ret = 0;
+
+    /* Create a revision walker */
+    ret = git_revwalk_new(&walker, repo);
+    GH_CHECK_GOTO(out, ret, "git_revwalk_new");
+
+    /* Push HEAD as the starting point */
+    ret = git_revwalk_push_head(walker);
+    GH_CHECK_GOTO(out, ret, "git_revwalk_push_head");
+
+    /* Set sorting: reverse chronological (default for git log) */
+    ret = git_revwalk_sorting(walker, GIT_SORT_TIME);
+    GH_CHECK_GOTO(out, ret, "git_revwalk_sorting");
+
+    /* Iterate through commits */
+    while ((ret = git_revwalk_next(&oid, walker)) == 0) {
+        if (count >= limit)
+            break;
+
+        /* Lookup the commit */
+        ret = git_commit_lookup(&commit, repo, &oid);
+        if (ret < 0) {
+            GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, ret, "git_commit_lookup");
             continue;
         }
 
-        for (size_t i = 0; i < list.count; i++) {
-            if (!git_oid_equal(git_object_id(obj), git_commit_id(list.commits[i])))
-                continue;
+        /* Get short hash */
+        char short_hash[GIT_OID_HEXSZ + 1];
+        git_oid_tostr(short_hash, sizeof(short_hash), &oid);
 
-            int is_tag = strncmp(name, "refs/tags/", 10) == 0;
-            size_t len = strlen(name) + 6;      /* "tag: " + name + NUL */
-            char *s = malloc(len);
-            if (!s) {
-                GH_LOG_ERROR("malloc(%zu) failed for decoration of %s", len, name);
-                return -1;
-            }
-            snprintf(s, len, "%s%s", is_tag ? "tag: " : "", name);
-            kv_push(char *, list.decor[i], s);
-            break;
-        }
-    }
+        /* Get author name */
+        const git_signature *author = git_commit_author(commit);
+        const char *author_name = author ? author->name : "";
 
-    /* 4. Emit one line per commit. */
-    for (size_t i = 0; i < list.count; i++) {
-        CLEANUP(cleanup_git_buf)       git_buf sid = GIT_BUF_INIT;
-        CLEANUP(cleanup_git_signature) git_signature *sig = NULL;
-        git_commit *c = list.commits[i];
-        const char *summary;
-        int first = 1;
+        /* Get author timestamp */
+        int64_t author_time = author ? author->when.time : 0;
 
-        /* %h */
-        ret = git_object_short_id(&sid, (git_object *)c);
-        GH_CHECK_RET(ret, "git_object_short_id (commit #%zu)", i);
-        kputs(sid.ptr, out);
-        kputc(FF, out);
+        /* Get commit subject */
+        const char *message = git_commit_message(commit);
+        const char *subject = message ? message : "";
+        const char *newline = strchr(subject, '\n');
+        size_t subject_len = newline ? (size_t)(newline - subject) : strlen(subject);
 
-        /* %D: HEAD entry first, then the rest in reverse ref order. */
-        if (git_oid_equal(head_oid, git_commit_id(c))) {
-            if (head_attached) {
-                kputs("HEAD -> ", out);
-                kputs(head_name, out);
-            } else {
-                kputs("HEAD", out);
-            }
-            first = 0;
-        }
-        for (size_t j = kv_size(list.decor[i]); j > 0; j--) {
-            if (!first)
-                kputs(", ", out);
-            kputs(kv_A(list.decor[i], j - 1), out);
-            first = 0;
-        }
-        kputc(FF, out);
-        kputc(FF, out);                         /* the empty field */
-
-        /* %aN, %at */
-        ret = git_commit_author_with_mailmap(&sig, c, mailmap);
-        GH_CHECK_RET(ret, "git_commit_author_with_mailmap (commit #%zu)", i);
-        kputs(sig->name, out);
-        kputc(FF, out);
-        put_i64(out, (long long)sig->when.time);
-        kputc(FF, out);
-
-        /* %s */
-        summary = git_commit_summary(c);
-        kputs(summary ? summary : "", out);
+        /* Format: %h%x0c%D%x0c%x0c%aN%x0c%at%x0c%s\n
+         * Note: Decorations (%D) are complex to implement with libgit2.
+         * For now, we skip decorations and just output the commit data. */
+        kputs(short_hash, out);
+        kputc('\x0c', out);
+        /* Decorations would go here - simplified for now */
+        kputc('\x0c', out);
+        kputc('\x0c', out);
+        kputs(author_name, out);
+        kputc('\x0c', out);
+        kputl((long)author_time, out);
+        kputc('\x0c', out);
+        kputsn(subject, subject_len, out);
         kputc('\n', out);
+
+        git_commit_free(commit);
+        commit = NULL;
+        count++;
     }
 
-    GH_LOG_DEBUG("emitted %zu log entries (limit %zu)", list.count, limit);
-    return 0;
+    /* GIT_ITEROVER is expected when we've walked all commits */
+    if (ret == GIT_ITEROVER)
+        ret = 0;
+    else
+        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, ret, "git_revwalk_next");
+
+out:
+    if (commit)
+        git_commit_free(commit);
+    if (walker)
+        git_revwalk_free(walker);
+
+    return ret;
 }
 
 /* usage: get_log(repo, 30, out); */
@@ -1196,6 +1314,7 @@ static int tag_cb(const char *name, git_oid *oid, void *payload)
 {
     find_tag_ctx *ctx = payload;
     git_object *obj = NULL, *commit = NULL;
+    int ret = 0;
 
     if (git_object_lookup(&obj, ctx->repo, oid, GIT_OBJECT_ANY) < 0) {
         GH_LOG_DEBUG("tag %s: object lookup failed, skipping", name);
@@ -1210,14 +1329,12 @@ static int tag_cb(const char *name, git_oid *oid, void *payload)
         ctx->match = strdup(n);
         if (!ctx->match)
             GH_LOG_ERROR("strdup failed for tag %s", n);
-        git_object_free(commit);
-        git_object_free(obj);
-        return 1; /* nonzero stops git_tag_foreach */
+        ret = 1; /* nonzero stops git_tag_foreach */
     }
 
     if (commit) git_object_free(commit);
     git_object_free(obj);
-    return 0;
+    return ret;
 }
 
 static int get_tag_desc_if_match(git_repository *repo, kstring_t *out) {
@@ -1247,38 +1364,131 @@ static int get_tag_desc_if_match(git_repository *repo, kstring_t *out) {
 }
 
 static int get_tag_desc(git_repository *repo, kstring_t *out) {
-    git_object *head = NULL;
-    git_describe_result *result = NULL;
-    git_describe_options opts = GIT_DESCRIBE_OPTIONS_INIT;
-    git_describe_format_options fmt = GIT_DESCRIBE_FORMAT_OPTIONS_INIT;
-    git_buf buf = GIT_BUF_INIT;
-    int ret;
+    /* Use libgit2 to find the nearest tag to HEAD.
+     * Note: This is a simplified version of git describe --long --tags.
+     * It finds tags pointing to HEAD or recent ancestors. */
+    git_revwalk *walker = NULL;
+    git_commit *commit = NULL;
+    git_oid oid;
+    git_reference *head_ref = NULL;
+    git_object *head_obj = NULL;
+    int ret = 0;
+    size_t commits_since_tag = 0;
+    char *tag_name = NULL;
+    const size_t max_search = 1000; /* Limit search depth */
 
-    ret = git_revparse_single(&head, repo, "HEAD");
-    GH_CHECK_RET(ret, "git_revparse_single(HEAD)");
-
-    opts.describe_strategy = GIT_DESCRIBE_TAGS;
-
-    ret = git_describe_commit(&result, head, &opts);
-    git_object_free(head);
-
-    /* With no reachable tag libgit2 returns GIT_ERROR (-1), not ENOTFOUND.
-     * That is an expected outcome, so it is logged at DEBUG. */
+    /* Get HEAD commit */
+    ret = git_repository_head(&head_ref, repo);
     if (ret < 0) {
-        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_DEBUG, ret, "git_describe_commit");
+        GH_LOG_DEBUG("No HEAD reference (repository may be empty)");
+        return 0; /* Not an error - empty repo */
+    }
+
+    ret = git_reference_peel(&head_obj, head_ref, GIT_OBJECT_COMMIT);
+    git_reference_free(head_ref);
+    if (ret < 0) {
+        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, ret, "git_reference_peel");
         return ret;
     }
 
-    fmt.always_use_long_format = 1;
+    git_object_free(head_obj);
 
-    ret = git_describe_format(&buf, result, &fmt);
-    if (ret == 0)
-        kputs(buf.ptr, out);
-    else
-        GH_LOG_GIT_ERR(ret, "git_describe_format");
+    /* Create revwalk to search for tags */
+    ret = git_revwalk_new(&walker, repo);
+    GH_CHECK_GOTO(out, ret, "git_revwalk_new");
 
-    git_buf_dispose(&buf);
-    git_describe_result_free(result);
+    ret = git_revwalk_push_head(walker);
+    GH_CHECK_GOTO(out, ret, "git_revwalk_push_head");
+
+    /* Walk commits to find tags */
+    while ((ret = git_revwalk_next(&oid, walker)) == 0 && commits_since_tag < max_search) {
+        ret = git_commit_lookup(&commit, repo, &oid);
+        if (ret < 0) {
+            GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, ret, "git_commit_lookup");
+            continue;
+        }
+
+        /* Check if this commit is tagged by iterating through all tags */
+        git_strarray tag_names = {0};
+        ret = git_tag_list(&tag_names, repo);
+        if (ret < 0) {
+            GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_WARN, ret, "git_tag_list");
+            git_commit_free(commit);
+            continue;
+        }
+
+        for (size_t i = 0; i < tag_names.count; i++) {
+            const char *tag_full = tag_names.strings[i];
+            git_reference *tag_ref = NULL;
+            git_tag *tag = NULL;
+            git_commit *tag_commit = NULL;
+
+            ret = git_reference_lookup(&tag_ref, repo, tag_full);
+            if (ret < 0)
+                continue;
+
+            const git_oid *tag_oid = git_reference_target(tag_ref);
+            if (!tag_oid) {
+                git_reference_free(tag_ref);
+                continue;
+            }
+
+            ret = git_tag_lookup(&tag, repo, tag_oid);
+            git_reference_free(tag_ref);
+            if (ret < 0)
+                continue;
+
+            const git_oid *tag_target = git_tag_target_id(tag);
+            ret = git_commit_lookup(&tag_commit, repo, tag_target);
+            git_tag_free(tag);
+            if (ret < 0)
+                continue;
+
+            if (git_oid_equal(git_commit_id(tag_commit), &oid)) {
+                /* Found a tag pointing to this commit */
+                const char *n = tag_full;
+                if (strncmp(n, "refs/tags/", 10) == 0)
+                    n += 10;
+                tag_name = strdup(n);
+                git_commit_free(tag_commit);
+                git_strarray_free(&tag_names);
+                goto found_tag;
+            }
+
+            git_commit_free(tag_commit);
+        }
+
+        git_strarray_free(&tag_names);
+        git_commit_free(commit);
+        commit = NULL;
+        commits_since_tag++;
+    }
+
+found_tag:
+    if (tag_name) {
+        /* Format: <tag>-<num_commits>-g<short_hash> if not exactly on tag,
+         * or just <tag> if exactly on tag */
+        if (commits_since_tag == 0) {
+            kputs(tag_name, out);
+        } else {
+            char short_hash[GIT_OID_HEXSZ + 1];
+            git_oid_tostr(short_hash, sizeof(short_hash), &oid);
+            kputs(tag_name, out);
+            kputc('-', out);
+            kputuw(commits_since_tag, out);
+            kputs("-g", out);
+            kputs(short_hash, out);
+        }
+        free(tag_name);
+    }
+
+    ret = 0; /* Not finding a tag is not an error */
+
+out:
+    if (commit)
+        git_commit_free(commit);
+    if (walker)
+        git_revwalk_free(walker);
 
     return ret;
 }
@@ -1542,6 +1752,72 @@ static int task_upstream_subj(git_repository *repo, kstring_t *out, void *arg) {
     return git_head_subject(repo, out, target);
 }
 
+/* Parallel task pattern - each task runs in its own thread with its own repo handle */
+typedef struct {
+    const char *repo_path;
+    int (*task_fn)(git_repository *, kstring_t *, void *);
+    kstring_t *out;
+    void *arg;
+    const char *name;
+    int optional;
+    int result;
+    uint64_t duration_ms;
+} parallel_task_t;
+
+static void *parallel_task_runner(void *arg) {
+    parallel_task_t *task = (parallel_task_t *)arg;
+    uint64_t t0 = gh_now_ms();
+    git_repository *repo = NULL;
+
+    int open_ret = git_repository_open_ext(&repo, task->repo_path, 0, NULL);
+    if (open_ret < 0) {
+        GH_LOG_GIT_ERR_AT(GH_LOG_LEVEL_ERROR, open_ret,
+                          "git_repository_open_ext(%s) in parallel task", task->repo_path);
+        task->result = open_ret;
+        task->duration_ms = gh_now_ms() - t0;
+        return NULL;
+    }
+
+    git_error_clear();
+    task->result = task->task_fn(repo, task->out, task->arg);
+    git_repository_free(repo);
+
+    task->duration_ms = gh_now_ms() - t0;
+    gh_log_step(__func__, __LINE__, task->name, task->result,
+                task->duration_ms, task->optional);
+    return NULL;
+}
+
+/* Helper to run tasks in parallel - define array first, then run */
+#define RUN_PARALLEL_TASKS(tasks, n_tasks) do { \
+    pthread_t threads[n_tasks]; \
+    for (int i = 0; i < n_tasks; i++) { \
+        pthread_create(&threads[i], NULL, parallel_task_runner, &tasks[i]); \
+    } \
+    for (int i = 0; i < n_tasks; i++) { \
+        pthread_join(threads[i], NULL); \
+    } \
+} while(0)
+
+/* For non-parallel tasks that need g_repo directly */
+#define RUN_TASK(name, task, out, arg) \
+    ({ \
+        uint64_t t0_ = gh_now_ms(); \
+        git_error_clear(); \
+        int ret_ = task(g_repo, out, arg); \
+        gh_log_step(__func__, __LINE__, name, ret_, gh_now_ms() - t0_, 0); \
+        ret_; \
+    })
+
+#define RUN_TASK_OPT(name, task, out, arg) \
+    ({ \
+        uint64_t t0_ = gh_now_ms(); \
+        git_error_clear(); \
+        int ret_ = task(g_repo, out, arg); \
+        gh_log_step(__func__, __LINE__, name, ret_, gh_now_ms() - t0_, 1); \
+        ret_; \
+    })
+
 static void git_root_worker(uv_work_t *req) {
     git_root_req_T *data = req->data;
     const uint64_t id = data->id;
@@ -1558,75 +1834,87 @@ static void git_root_worker(uv_work_t *req) {
     }
     data->repo = g_repo;
 
+    /* Load commit-graph for fast history queries */
+    load_commit_graph(g_repo);
+
     const char *root = git_repository_workdir(g_repo);
     char oid_str[GIT_OID_MAX_HEXSIZE + 1];
 
-    /* Phase 1: Independent tasks - run directly (we're already in a worker thread) */
+    /* Phase 1: Independent tasks - all run in parallel */
     data->list_z = str_create(NULL, 0);
-    int list_z_ret = task_config_list_z(g_repo, data->list_z, NULL);
-
     data->head_log_line = str_create(NULL, 0);
     data->subj = str_create(NULL, 0);
-    int subj_ret = task_head_subject(g_repo, data->subj, NULL);
-
-    int rev_ret = task_rev_head(g_repo, NULL, oid_str);
-
     data->tag_desc = str_create(NULL, 0);
-    int tag_desc_ret = task_tag_desc(g_repo, data->tag_desc, NULL);
-
     data->opt_tag_desc_head = str_create(NULL, 0);
-    int opt_tag_desc_head_ret = task_tag_desc_if_match(g_repo, data->opt_tag_desc_head, NULL);
-
     data->worktree_porcelain = str_create(NULL, 0);
-    int worktree_porcelain_ret = task_worktrees_porcelain(g_repo, data->worktree_porcelain, NULL);
-
     data->config_status_show_untracked_files = str_create(NULL, 0);
-    int config_status_show_untracked_files_ret = task_config_show_untracked(g_repo, data->config_status_show_untracked_files, NULL);
-
     data->status = str_create(NULL, 0);
-    int status_ret = task_status_porcelain_z(g_repo, data->status, NULL);
-
     data->diff = str_create(NULL, 0);
-    int diff_ret = task_diff_patch(g_repo, data->diff, NULL);
-
     data->staged = str_create(NULL, 0);
-    int staged_ret = task_staged(g_repo, data->staged, NULL);
-
     data->stash = str_create(NULL, 0);
-    int stash_ret = task_stash_oid(g_repo, data->stash, NULL);
-
     data->branches = str_create(NULL, 0);
-    int branches_ret = task_branch_list(g_repo, data->branches, NULL);
-
     data->revision_by_idx = str_create(NULL, 0);
-    int revision_ret = task_rev_parse_verify(g_repo, data->revision_by_idx, NULL);
-
     data->logs = str_create(NULL, 0);
-    int logs_ret = task_log(g_repo, data->logs, NULL);
-
     data->rev_short_head = str_create(NULL, 0);
-    int rev_short_head = task_rev_parse_short_head(g_repo, data->rev_short_head, NULL);
-
     data->tag_master = str_create(NULL, 0);
-    int tag_master = task_tag_master(g_repo, data->tag_master, NULL);
-
     data->tag_origin_master = str_create(NULL, 0);
-    int tag_origin_master_ret = task_tag_origin_master(g_repo, data->tag_origin_master, NULL);
-
     data->tag_origin_head = str_create(NULL, 0);
-    int tag_origin_head_ret = task_tag_origin_head(g_repo, data->tag_origin_head, NULL);
-
     data->origin_head = str_create(NULL, 0);
-    int origin_head_ret = task_origin_head(g_repo, data->origin_head, NULL);
-
     data->upstream_branch_master = str_create(NULL, 0);
-    int upstream_branch_master_ret = task_upstream_branch_master(g_repo, data->upstream_branch_master, NULL);
+
+    parallel_task_t tasks[] = {
+        {data->repo_path->s, task_config_list_z, data->list_z, NULL, "config_list_z", 0, 0, 0},
+        {data->repo_path->s, task_head_subject, data->subj, NULL, "head_subject", 0, 0, 0},
+        {data->repo_path->s, task_tag_desc, data->tag_desc, NULL, "tag_desc", 1, 0, 0},
+        {data->repo_path->s, task_tag_desc_if_match, data->opt_tag_desc_head, NULL, "tag_desc_if_match", 0, 0, 0},
+        {data->repo_path->s, task_worktrees_porcelain, data->worktree_porcelain, NULL, "worktrees_porcelain", 0, 0, 0},
+        {data->repo_path->s, task_config_show_untracked, data->config_status_show_untracked_files, NULL, "config_show_untracked_files", 0, 0, 0},
+        {data->repo_path->s, task_status_porcelain_z, data->status, NULL, "status_porcelain_z", 0, 0, 0},
+        {data->repo_path->s, task_diff_patch, data->diff, NULL, "diff_patch", 0, 0, 0},
+        {data->repo_path->s, task_staged, data->staged, NULL, "staged", 0, 0, 0},
+        {data->repo_path->s, task_stash_oid, data->stash, NULL, "stash_oid", 1, 0, 0},
+        {data->repo_path->s, task_branch_list, data->branches, NULL, "branch_list", 0, 0, 0},
+        {data->repo_path->s, task_rev_parse_verify, data->revision_by_idx, NULL, "rev_parse_verify", 1, 0, 0},
+        {data->repo_path->s, task_log, data->logs, NULL, "log", 0, 0, 0},
+        {data->repo_path->s, task_rev_parse_short_head, data->rev_short_head, NULL, "rev_parse_short_head", 0, 0, 0},
+        {data->repo_path->s, task_tag_master, data->tag_master, NULL, "tag_master", 1, 0, 0},
+        {data->repo_path->s, task_tag_origin_master, data->tag_origin_master, NULL, "tag_origin_master", 1, 0, 0},
+        {data->repo_path->s, task_tag_origin_head, data->tag_origin_head, NULL, "tag_origin_head", 1, 0, 0},
+        {data->repo_path->s, task_origin_head, data->origin_head, NULL, "origin_head", 1, 0, 0},
+        {data->repo_path->s, task_upstream_branch_master, data->upstream_branch_master, NULL, "upstream_branch_master", 1, 0, 0}
+    };
+
+    RUN_PARALLEL_TASKS(tasks, 19);
+
+    /* Extract results from parallel tasks */
+    int list_z_ret = tasks[0].result;
+    int subj_ret = tasks[1].result;
+    int tag_desc_ret = tasks[2].result;
+    int opt_tag_desc_head_ret = tasks[3].result;
+    int worktree_porcelain_ret = tasks[4].result;
+    int config_status_show_untracked_files_ret = tasks[5].result;
+    int status_ret = tasks[6].result;
+    int diff_ret = tasks[7].result;
+    int staged_ret = tasks[8].result;
+    int stash_ret = tasks[9].result;
+    int branches_ret = tasks[10].result;
+    int revision_ret = tasks[11].result;
+    int logs_ret = tasks[12].result;
+    int rev_short_head = tasks[13].result;
+    int tag_master = tasks[14].result;
+    int tag_origin_master_ret = tasks[15].result;
+    int tag_origin_head_ret = tasks[16].result;
+    int origin_head_ret = tasks[17].result;
+    int upstream_branch_master_ret = tasks[18].result;
+
+    /* rev_head needs to run in main thread (uses oid_str buffer) */
+    int rev_ret = RUN_TASK("rev_head", task_rev_head, NULL, oid_str);
 
     data->is_bare = git_repository_is_bare(g_repo) ? 1 : 0;
 
     /* Phase 2: Tasks that depend on branch */
     data->branch = str_create(NULL, 0);
-    int branch_ret = task_symbolic_ref_short_head(g_repo, data->branch, NULL);
+    int branch_ret = RUN_TASK_OPT("symbolic_ref_short_head", task_symbolic_ref_short_head, data->branch, NULL);
     if (branch_ret != 0)
         GH_LOG_DEBUG("request %" PRIu64 ": no current branch (detached HEAD?) rc=%d, "
                      "branch left empty", id, branch_ret);
@@ -1635,7 +1923,7 @@ static void git_root_worker(uv_work_t *req) {
     data->upstream_branch = str_create(NULL, 0);
     int upstream_branch_ret = -1;
     if (branch_ret == 0) {
-        upstream_branch_ret = task_branch_upstream_name(g_repo, data->upstream_branch, data->branch->s);
+        upstream_branch_ret = RUN_TASK_OPT("branch_upstream_name", task_branch_upstream_name, data->upstream_branch, data->branch->s);
         if (upstream_branch_ret != 0)
             GH_LOG_DEBUG("request %" PRIu64 ": branch '%s' has no upstream rc=%d",
                          id, data->branch->s, upstream_branch_ret);
@@ -1650,7 +1938,7 @@ static void git_root_worker(uv_work_t *req) {
         char target_str[] = "refs/remotes/";
         STR_CLEANUP kstring_t *target = str_create(target_str, sizeof(target_str) - 1);
         kputs(data->upstream_branch->s, target);
-        upstream_subj_ret = task_upstream_subj(g_repo, data->upstream_subj, target->s);
+        upstream_subj_ret = RUN_TASK_OPT("upstream_subj", task_upstream_subj, data->upstream_subj, target->s);
     }
 
     if (tag_desc_ret != 0) {
